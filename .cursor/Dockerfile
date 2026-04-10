@@ -50,6 +50,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # gitleaks
 ########################################################
 ARG GITLEAKS_VERSION=8.24.3
+# Default is for single-arch builds; docker buildx / BuildKit set TARGETARCH per platform and override this.
 ARG TARGETARCH=amd64
 RUN set -eux; \
     case "$TARGETARCH" in \
