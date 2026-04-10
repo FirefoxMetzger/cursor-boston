@@ -5,23 +5,18 @@
 # Multi-stage build for optimized image size
 # ==========================================
 
-# Stage 1: Dependencies
-FROM node:22-alpine AS deps
+# Builder: install all dependencies (including devDependencies) needed for
+# `npm run build` (e.g. tsx in prebuild/validate-env, Tailwind/PostCSS).
+# Do not use `npm ci --omit=dev` here: the `prepare` script runs `husky install`,
+# and husky is a devDependency — production-only installs fail with "husky: not found".
+# .dockerignore excludes `.git`, so `husky install` skips hook setup (non-fatal).
+FROM node:22-alpine AS builder
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 
-# Copy package files
 COPY package.json package-lock.json ./
+RUN npm ci && npm cache clean --force
 
-# Install dependencies
-RUN npm ci --only=production && npm cache clean --force
-
-# Stage 2: Builder
-FROM node:22-alpine AS builder
-WORKDIR /app
-
-# Copy dependencies from deps stage
-COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Build arguments for Next.js public environment variables
@@ -51,7 +46,7 @@ ENV DOCKER_BUILD=1
 # Build the application
 RUN npm run build
 
-# Stage 3: Runner (Production)
+# Runner (production)
 FROM node:22-alpine AS runner
 WORKDIR /app
 
