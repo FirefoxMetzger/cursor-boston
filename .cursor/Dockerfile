@@ -20,7 +20,6 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 
 ########################################################
 # Docker (Cursor Cloud Agent — nested Docker)
-# Pin the 5:28 CE line (apt wildcard picks latest patch in that line); bump major.minor when upgrading intentionally.
 ########################################################
 RUN install -m 0755 -d /etc/apt/keyrings && \
     curl --retry 3 --retry-delay 5 -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg && \
