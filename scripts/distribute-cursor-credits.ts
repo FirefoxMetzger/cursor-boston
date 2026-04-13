@@ -23,9 +23,13 @@ loadEnvConfig(process.cwd());
 
 import type { DocumentData } from "firebase-admin/firestore";
 import { getAdminDb } from "../lib/firebase-admin";
-import { fetchShowcaseSubmissionsFromGitHub } from "../lib/hackathon-showcase";
+import { HACK_A_SPRINT_2026_EVENT_ID, fetchShowcaseSubmissionsFromGitHub } from "../lib/hackathon-showcase";
 import { computeHackASprint2026RawScore } from "../lib/hackathon-asprint-2026-scores";
-import { hackASprint2026ScoreDocId } from "../lib/hackathon-asprint-2026-state";
+import { computePeerAverages } from "../lib/hackathon-asprint-2026-participant-scoring";
+import {
+  getAllHackASprint2026ParticipantScoreDocs,
+  hackASprint2026ScoreDocId,
+} from "../lib/hackathon-asprint-2026-state";
 import { CURSOR_CREDIT_TOP_N } from "../lib/hackathon-event-signup";
 import { sendEmail } from "../lib/mailgun";
 
@@ -69,11 +73,13 @@ type RankedEntry = {
   title: string;
   rawScore: number | null;
   peerVoteCount: number;
+  peerAverage: number | null;
   userId: string | null;
   email: string | null;
   displayName: string | null;
   creditUrl: string | null;
   isPrizeWinner: boolean;
+  checkedIn: boolean;
 };
 
 async function sleep(ms: number) {
@@ -135,6 +141,27 @@ async function main() {
     }
   });
 
+  const identities = submissions.map((s) => ({
+    submissionId: s.submissionId,
+    githubLogin: s.githubLogin,
+  }));
+  const voterDocs = await getAllHackASprint2026ParticipantScoreDocs(db);
+  const voterUids = [...new Set(voterDocs.map((d) => d.userId))];
+  const voterRefs = voterUids.map((uid) => db.collection("users").doc(uid));
+  const voterSnaps = voterRefs.length > 0 ? await db.getAll(...voterRefs) : [];
+  const voterGithubByUid = new Map<string, string>();
+  for (const snap of voterSnaps) {
+    const login = snap.data()?.github?.login;
+    if (typeof login === "string" && login.trim()) {
+      voterGithubByUid.set(snap.id, login.trim().toLowerCase());
+    }
+  }
+  const peerAvgBySid = computePeerAverages(
+    identities,
+    voterDocs,
+    voterGithubByUid
+  );
+
   // Build ranked list
   const scored = submissions.map((s) => {
     const data = scoreBySid.get(s.submissionId);
@@ -149,19 +176,22 @@ async function main() {
     const peerVoteCount =
       typeof data?.peerVoteCount === "number" ? data.peerVoteCount : 0;
     const rawScore = computeHackASprint2026RawScore(aiScore, judgeScores);
-    return { ...s, rawScore, peerVoteCount };
+    const peerAverage = peerAvgBySid.get(s.submissionId.toLowerCase()) ?? null;
+    return { ...s, rawScore, peerVoteCount, peerAverage };
   });
 
   scored.sort((a, b) => {
     const ra = a.rawScore ?? -1;
     const rb = b.rawScore ?? -1;
     if (rb !== ra) return rb - ra;
+    const pa = a.peerAverage ?? -1;
+    const pb = b.peerAverage ?? -1;
+    if (pb !== pa) return pb - pa;
     return (b.peerVoteCount ?? 0) - (a.peerVoteCount ?? 0);
   });
 
   // Resolve user IDs and emails from event signups + users collection
   console.log("Resolving user emails…");
-  // Fetch all users in one batch for mapping github login → userId → email
   const userByGithubLogin = new Map<string, { uid: string; email: string | null; displayName: string | null }>();
   const userSnap = await db.collection("users").get();
   for (const doc of userSnap.docs) {
@@ -176,10 +206,29 @@ async function main() {
     }
   }
 
+  // Only checked-in users receive credit links
+  console.log("Loading check-in status…");
+  const checkedInUserIds = new Set<string>();
+  const signupSnap = await db
+    .collection("hackathonEventSignups")
+    .where("eventId", "==", HACK_A_SPRINT_2026_EVENT_ID)
+    .get();
+  for (const doc of signupSnap.docs) {
+    const d = doc.data();
+    if (d.checkedInAt) checkedInUserIds.add(d.userId as string);
+  }
+  console.log(`Checked-in users: ${checkedInUserIds.size}`);
+
+  let creditIdx = 0;
   const entries: RankedEntry[] = scored.map((s, i) => {
     const rank = i + 1;
     const user = userByGithubLogin.get(s.submissionId);
-    const creditUrl = rank <= creditUrls.length ? creditUrls[rank - 1]! : null;
+    const isCheckedIn = user?.uid ? checkedInUserIds.has(user.uid) : false;
+    let creditUrl: string | null = null;
+    if (isCheckedIn && creditIdx < creditUrls.length) {
+      creditUrl = creditUrls[creditIdx]!;
+      creditIdx++;
+    }
     return {
       rank,
       submissionId: s.submissionId,
@@ -187,22 +236,33 @@ async function main() {
       title: s.payload.title,
       rawScore: s.rawScore,
       peerVoteCount: s.peerVoteCount,
+      peerAverage: s.peerAverage,
       userId: user?.uid ?? null,
       email: user?.email ?? null,
       displayName: user?.displayName ?? null,
       creditUrl,
       isPrizeWinner: rank <= PRIZE_POOL_SPOTS,
+      checkedIn: isCheckedIn,
     };
   });
 
   // Print ranked table
   const pad = (s: string, n: number) => s.slice(0, n).padEnd(n);
-  console.log(`\n${pad("Rank", 6)} ${pad("Login", 25)} ${pad("Score", 7)} ${pad("Peer", 6)} ${pad("Email", 35)} Prize`);
-  console.log("-".repeat(100));
+  console.log(`\n${pad("Rank", 6)} ${pad("Login", 25)} ${pad("Score", 7)} ${pad("Pavg", 6)} ${pad("Email", 35)} ${pad("In?", 5)} Prize`);
+  console.log("-".repeat(110));
   for (const e of entries) {
+    const prizeLabel = !e.checkedIn ? "—(not checked in)" : e.isPrizeWinner ? PRIZE_AMOUNT_TOP6 : e.rank <= CURSOR_CREDIT_TOP_N ? CREDIT_AMOUNT : "—";
     console.log(
-      `${pad(`#${e.rank}`, 6)} ${pad(e.githubLogin, 25)} ${pad(e.rawScore != null ? String(e.rawScore) : "—", 7)} ${pad(String(e.peerVoteCount), 6)} ${pad(e.email ?? "—", 35)} ${e.isPrizeWinner ? PRIZE_AMOUNT_TOP6 : e.rank <= CURSOR_CREDIT_TOP_N ? CREDIT_AMOUNT : "—"}`
+      `${pad(`#${e.rank}`, 6)} ${pad(e.githubLogin, 25)} ${pad(e.rawScore != null ? String(e.rawScore) : "—", 7)} ${pad(e.peerAverage != null ? e.peerAverage.toFixed(2) : "—", 6)} ${pad(e.email ?? "—", 35)} ${pad(e.checkedIn ? "YES" : "—", 5)} ${prizeLabel}`
     );
+  }
+
+  const notCheckedIn = entries.filter((e) => !e.checkedIn);
+  if (notCheckedIn.length > 0) {
+    console.warn(`\n[warn] ${notCheckedIn.length} submission(s) from users NOT checked in (no credit assigned):`);
+    for (const e of notCheckedIn) {
+      console.warn(`  #${e.rank} @${e.githubLogin}`);
+    }
   }
 
   if (!creditsPath) {
@@ -268,7 +328,7 @@ function buildCreditEmail(entry: RankedEntry): { subject: string; html: string; 
   if (entry.isPrizeWinner) {
     subject = `Hack-a-Sprint: Congratulations #${entry.rank} — ${PRIZE_AMOUNT_TOP6} prize + ${CREDIT_AMOUNT} Cursor credit`;
     body = `<p>Hi ${name},</p>
-<p>Congratulations! You placed <strong>#${entry.rank}</strong> at the Cursor Boston Hack-a-Sprint with a score of <strong>${entry.rawScore ?? "—"}</strong> and <strong>${entry.peerVoteCount}</strong> peer vote${entry.peerVoteCount === 1 ? "" : "s"} for <strong>${escapeHtml(entry.title)}</strong>.</p>
+<p>Congratulations! You placed <strong>#${entry.rank}</strong> at the Cursor Boston Hack-a-Sprint with a score of <strong>${entry.rawScore ?? "—"}</strong>${entry.peerAverage != null ? ` and peer average <strong>${entry.peerAverage.toFixed(2)}</strong>` : ""} for <strong>${escapeHtml(entry.title)}</strong>.</p>
 <p>You've won <strong>${PRIZE_AMOUNT_TOP6}</strong> from the prize pool, plus <strong>${CREDIT_AMOUNT} in Cursor credits</strong>.</p>
 <p><strong>Redeem your Cursor credit here:</strong><br/>
 <a href="${creditLink}" style="display:inline-block;margin:8px 0;padding:10px 20px;background:#10b981;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">${creditLink}</a></p>

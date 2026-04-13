@@ -21,6 +21,11 @@ interface CommunityFeedProps {
 export function CommunityFeed({ user, onViewMemberProfile }: CommunityFeedProps) {
   const {
     loading,
+    loadingMore,
+    hasMore,
+    loadMore,
+    error,
+    clearError,
     newMessage,
     setNewMessage,
     posting,
@@ -88,7 +93,7 @@ export function CommunityFeed({ user, onViewMemberProfile }: CommunityFeedProps)
             value={feedSearchQuery}
             onChange={(e) => setFeedSearchQuery(e.target.value)}
             placeholder="Search messages..."
-            className="w-full pl-11 pr-4 py-3 bg-neutral-900 border border-neutral-800 rounded-lg text-white placeholder-neutral-400 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent"
+            className="w-full pl-11 pr-4 py-3 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-lg text-neutral-900 dark:text-white placeholder-neutral-400 focus:outline-none focus:ring-2 focus:ring-emerald-400 focus:border-transparent"
           />
           {feedSearchQuery && (
             <button
@@ -118,6 +123,19 @@ export function CommunityFeed({ user, onViewMemberProfile }: CommunityFeedProps)
           onSubmit={postMessage}
           posting={posting}
         />
+
+        {/* Error State */}
+        {error && (
+          <div className="flex items-center justify-between gap-4 p-4 mb-6 bg-red-500/10 border border-red-500/20 rounded-lg">
+            <p className="text-red-400 text-sm">{error}</p>
+            <button
+              onClick={clearError}
+              className="text-sm text-red-400 hover:text-red-300 underline shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         {/* Messages Feed */}
         {loading ? (
@@ -174,6 +192,17 @@ export function CommunityFeed({ user, onViewMemberProfile }: CommunityFeedProps)
                 currentUserId={user?.uid}
               />
             ))}
+            {hasMore && !feedSearchQuery && (
+              <div className="flex justify-center pt-4 pb-2">
+                <button
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="px-6 py-2.5 text-sm font-medium text-neutral-300 bg-neutral-800 border border-neutral-700 rounded-lg hover:bg-neutral-700 hover:text-white disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                >
+                  {loadingMore ? "Loading..." : "Load more"}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </div>

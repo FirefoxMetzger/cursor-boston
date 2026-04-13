@@ -144,6 +144,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
       displayName: string | null;
       githubLogin: string | null;
       confirmedAt: number | null;
+      frozenRank: number | null;
+      frozenPrCount: number | null;
+      checkedInAt: number | null;
+      willBeLate: boolean;
+      queuingForSpot: boolean;
     }[] = [];
 
     const userIds = snap.docs.map((d) => d.data().userId as string).filter(Boolean);
@@ -166,6 +171,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
       const userId = data.userId as string;
       if (!userId) continue;
       const profile = userMap.get(userId);
+      if (
+        typeof profile?.email === "string" &&
+        DECLINED_EMAILS.has(profile.email.toLowerCase())
+      ) {
+        continue;
+      }
       const gh =
         profile?.github && typeof profile.github === "object"
           ? (profile.github as { login?: string }).login
@@ -184,6 +195,11 @@ export async function GET(request: NextRequest, context: RouteContext) {
           typeof profile?.displayName === "string" ? profile.displayName : null,
         githubLogin,
         confirmedAt: data.confirmedAt ? signedUpAtToMs(data.confirmedAt) : null,
+        frozenRank: typeof data.frozenRank === "number" ? data.frozenRank : null,
+        frozenPrCount: typeof data.frozenPrCount === "number" ? data.frozenPrCount : null,
+        checkedInAt: data.checkedInAt ? signedUpAtToMs(data.checkedInAt) : null,
+        willBeLate: data.willBeLate === true,
+        queuingForSpot: data.queuingForSpot === true,
       });
     }
 
@@ -196,6 +212,21 @@ export async function GET(request: NextRequest, context: RouteContext) {
       const gh = profile?.github && typeof profile.github === "object"
         ? (profile.github as { login?: string }).login : undefined;
       if (typeof gh === "string" && gh.trim()) websiteGithubLogins.add(gh.trim().toLowerCase());
+    }
+
+    // Reverse-lookup maps: email/githubLogin → rows index (for merging Luma fields)
+    const emailToRowIdx = new Map<string, number>();
+    const ghLoginToRowIdx = new Map<string, number>();
+    for (let i = 0; i < rows.length; i++) {
+      const profile = userMap.get(rows[i].userId);
+      if (typeof profile?.email === "string") {
+        emailToRowIdx.set(profile.email.toLowerCase(), i);
+      }
+      const gh = profile?.github && typeof profile.github === "object"
+        ? (profile.github as { login?: string }).login : undefined;
+      if (typeof gh === "string" && gh.trim()) {
+        ghLoginToRowIdx.set(gh.trim().toLowerCase(), i);
+      }
     }
 
     // Fetch Luma-only registrants
@@ -211,6 +242,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
       lumaCreatedAt: string;
       mergedPrCount: number;
       confirmedAt: number | null;
+      frozenRank: number | null;
+      frozenPrCount: number | null;
     };
     const lumaRows: LumaRow[] = [];
 
@@ -219,8 +252,31 @@ export async function GET(request: NextRequest, context: RouteContext) {
       const email = (d.email as string || "").toLowerCase();
       const ghLogin = typeof d.githubLogin === "string" ? d.githubLogin : null;
       if (JUDGE_EMAILS.has(email) || DECLINED_EMAILS.has(email)) continue;
-      if (websiteEmails.has(email)) continue;
-      if (ghLogin && websiteGithubLogins.has(ghLogin.toLowerCase())) continue;
+
+      // When a Luma registrant also signed up on the website, carry over
+      // confirmed status from the Luma record so it isn't lost.
+      // Also preserve the earlier signup time so waitlist ordering stays stable.
+      const matchIdx = websiteEmails.has(email)
+        ? emailToRowIdx.get(email)
+        : (ghLogin && websiteGithubLogins.has(ghLogin.toLowerCase()))
+          ? ghLoginToRowIdx.get(ghLogin.toLowerCase())
+          : undefined;
+      if (matchIdx !== undefined) {
+        if (rows[matchIdx].confirmedAt == null && d.confirmedAt) {
+          rows[matchIdx].confirmedAt = signedUpAtToMs(d.confirmedAt);
+        }
+        if (rows[matchIdx].frozenRank == null && typeof d.frozenRank === "number") {
+          rows[matchIdx].frozenRank = d.frozenRank;
+        }
+        if (rows[matchIdx].frozenPrCount == null && typeof d.frozenPrCount === "number") {
+          rows[matchIdx].frozenPrCount = d.frozenPrCount;
+        }
+        const lumaMs = d.lumaCreatedAt ? new Date(d.lumaCreatedAt as string).getTime() : 0;
+        if (lumaMs > 0 && lumaMs < rows[matchIdx].signedUpAtMs) {
+          rows[matchIdx].signedUpAtMs = lumaMs;
+        }
+        continue;
+      }
       if (ghLogin) lumaGithubLogins.push(ghLogin);
       lumaRows.push({
         name: typeof d.name === "string" ? d.name : "",
@@ -228,6 +284,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
         lumaCreatedAt: typeof d.lumaCreatedAt === "string" ? d.lumaCreatedAt : "",
         mergedPrCount: 0,
         confirmedAt: d.confirmedAt ? signedUpAtToMs(d.confirmedAt) : null,
+        frozenRank: typeof d.frozenRank === "number" ? d.frozenRank : null,
+        frozenPrCount: typeof d.frozenPrCount === "number" ? d.frozenPrCount : null,
       });
     }
 
@@ -242,8 +300,6 @@ export async function GET(request: NextRequest, context: RouteContext) {
       }
     }
 
-    // Merge everything into one unified list, sorted by PR count then signup time
-    type EntrySource = "website" | "luma_only";
     type UnifiedRow = {
       userId: string | null;
       displayName: string | null;
@@ -251,8 +307,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
       mergedPrCount: number;
       signedUpAtMs: number;
       signedUpAtIso: string;
-      source: EntrySource;
       confirmedAt: number | null;
+      frozenRank: number | null;
+      frozenPrCount: number | null;
+      checkedInAt: number | null;
+      willBeLate: boolean;
+      queuingForSpot: boolean;
     };
     const unified: UnifiedRow[] = [];
 
@@ -264,8 +324,12 @@ export async function GET(request: NextRequest, context: RouteContext) {
         mergedPrCount: r.mergedPrCount,
         signedUpAtMs: r.signedUpAtMs,
         signedUpAtIso: new Date(r.signedUpAtMs).toISOString(),
-        source: "website",
         confirmedAt: r.confirmedAt,
+        frozenRank: r.frozenRank,
+        frozenPrCount: r.frozenPrCount,
+        checkedInAt: r.checkedInAt,
+        willBeLate: r.willBeLate,
+        queuingForSpot: r.queuingForSpot,
       });
     }
     for (const lr of lumaRows) {
@@ -276,38 +340,54 @@ export async function GET(request: NextRequest, context: RouteContext) {
         mergedPrCount: lr.mergedPrCount,
         signedUpAtMs: lr.lumaCreatedAt ? new Date(lr.lumaCreatedAt).getTime() : 0,
         signedUpAtIso: lr.lumaCreatedAt,
-        source: "luma_only",
         confirmedAt: lr.confirmedAt,
+        frozenRank: typeof lr.frozenRank === "number" ? lr.frozenRank : null,
+        frozenPrCount: typeof lr.frozenPrCount === "number" ? lr.frozenPrCount : null,
+        checkedInAt: null,
+        willBeLate: false,
+        queuingForSpot: false,
       });
     }
 
-    // Frozen confirmed first; within each group: PRs desc → website before luma → registration time asc
-    unified.sort((a, b) => {
-      const ac = a.confirmedAt != null ? 1 : 0;
-      const bc = b.confirmedAt != null ? 1 : 0;
-      if (bc !== ac) return bc - ac;
+    // Split into confirmed (frozen rank) and waitlisted (live PRs)
+    const confirmed = unified.filter((u) => u.confirmedAt != null);
+    const waitlisted = unified.filter((u) => u.confirmedAt == null);
+
+    // Confirmed: sort by frozen rank (from ranking JSON), fallback to PRs desc → time asc
+    confirmed.sort((a, b) => {
+      if (a.frozenRank != null && b.frozenRank != null) return a.frozenRank - b.frozenRank;
+      if (a.frozenRank != null) return -1;
+      if (b.frozenRank != null) return 1;
       if (b.mergedPrCount !== a.mergedPrCount) return b.mergedPrCount - a.mergedPrCount;
-      const aWeb = a.source === "website" ? 1 : 0;
-      const bWeb = b.source === "website" ? 1 : 0;
-      if (bWeb !== aWeb) return bWeb - aWeb;
       return a.signedUpAtMs - b.signedUpAtMs;
     });
 
-    // Build ranked entries — status driven by confirmedAt field
+    // Waitlisted: sort by all-time PRs desc (jockeying) → signup time asc
+    waitlisted.sort((a, b) => {
+      if (b.mergedPrCount !== a.mergedPrCount) return b.mergedPrCount - a.mergedPrCount;
+      return a.signedUpAtMs - b.signedUpAtMs;
+    });
+
+    const sorted = [...confirmed, ...waitlisted];
+
     type EntryStatus = "confirmed" | "waitlisted";
     const websiteCount = rows.length;
-    const entries = unified.map((u, i) => {
+    const entries = sorted.map((u, i) => {
       const rank = i + 1;
       const isConfirmed = u.confirmedAt != null;
+      const displayPrs = isConfirmed && u.frozenPrCount != null ? u.frozenPrCount : u.mergedPrCount;
       return {
         rank,
         userId: u.userId,
         displayName: u.displayName,
         githubLogin: u.githubLogin,
-        mergedPrCount: u.mergedPrCount,
+        mergedPrCount: displayPrs,
         signedUpAt: u.signedUpAtIso,
         creditEligible: isConfirmed,
         status: (isConfirmed ? "confirmed" : "waitlisted") as EntryStatus,
+        checkedIn: u.checkedInAt != null,
+        willBeLate: u.willBeLate,
+        queuingForSpot: u.queuingForSpot,
       };
     });
 
@@ -317,6 +397,8 @@ export async function GET(request: NextRequest, context: RouteContext) {
       mergedPrCount: number | null;
       signedUpAt: string | null;
       creditEligible: boolean;
+      willBeLate: boolean;
+      queuingForSpot: boolean;
     } | null = null;
 
     if (meUser) {
@@ -328,8 +410,18 @@ export async function GET(request: NextRequest, context: RouteContext) {
             mergedPrCount: entry.mergedPrCount,
             signedUpAt: entry.signedUpAt,
             creditEligible: entry.creditEligible,
+            willBeLate: entry.willBeLate,
+            queuingForSpot: entry.queuingForSpot,
           }
-        : { signedUp: false, rank: null, mergedPrCount: null, signedUpAt: null, creditEligible: false };
+        : {
+            signedUp: false,
+            rank: null,
+            mergedPrCount: null,
+            signedUpAt: null,
+            creditEligible: false,
+            willBeLate: false,
+            queuingForSpot: false,
+          };
     }
 
     return NextResponse.json({
@@ -397,6 +489,120 @@ export async function POST(request: NextRequest, context: RouteContext) {
   } catch (e) {
     console.error("[hackathon event signup POST]", e);
     return NextResponse.json({ error: "Failed to sign up" }, { status: 500 });
+  }
+}
+
+/**
+ * PATCH RSVP flags on the user's own signup doc.
+ * Body: { willBeLate?: boolean, queuingForSpot?: boolean, giveUpSpot?: true }
+ * - willBeLate: only when confirmed (confirmedAt set)
+ * - queuingForSpot: only when waitlisted (no confirmedAt)
+ * - giveUpSpot: confirmed attendee releases their spot (clears confirmedAt)
+ */
+export async function PATCH(request: NextRequest, context: RouteContext) {
+  try {
+    const clientId = getClientIdentifier(request as unknown as Request);
+    const rate = checkRateLimit(`hackathon-event-signup-patch:${clientId}`, RATE);
+    if (!rate.success) {
+      return NextResponse.json(
+        { error: "Too many requests", retryAfterSeconds: rate.retryAfter },
+        { status: 429, headers: { "Retry-After": String(rate.retryAfter || 60) } }
+      );
+    }
+
+    const user = await getVerifiedUser(request);
+    if (!user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+
+    const { eventId: raw } = await context.params;
+    const eventId = raw?.trim() ?? "";
+    if (!isHackathonEventSignupId(eventId)) {
+      return NextResponse.json({ error: "Unknown event" }, { status: 404 });
+    }
+
+    let body: Record<string, unknown>;
+    try {
+      body = (await request.json()) as Record<string, unknown>;
+    } catch {
+      return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+    }
+
+    const db = getAdminDb();
+    if (!db) {
+      return NextResponse.json({ error: "Server not configured" }, { status: 500 });
+    }
+
+    const docId = hackathonEventSignupDocId(eventId, user.uid);
+    const ref = db.collection("hackathonEventSignups").doc(docId);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return NextResponse.json({ error: "Not signed up for this event" }, { status: 404 });
+    }
+
+    const data = snap.data() ?? {};
+    const isConfirmed = Boolean(data.confirmedAt);
+
+    if (body.giveUpSpot === true) {
+      if (!isConfirmed) {
+        return NextResponse.json(
+          { error: "Only confirmed attendees can give up their spot" },
+          { status: 400 }
+        );
+      }
+      await ref.update({
+        confirmedAt: FieldValue.delete(),
+        gaveUpSpotAt: FieldValue.serverTimestamp(),
+        willBeLate: FieldValue.delete(),
+      });
+      return NextResponse.json({ ok: true, gaveUpSpot: true }, { status: 200 });
+    }
+
+    const patch: Record<string, unknown> = {};
+    if (Object.prototype.hasOwnProperty.call(body, "willBeLate")) {
+      if (typeof body.willBeLate !== "boolean") {
+        return NextResponse.json({ error: "willBeLate must be a boolean" }, { status: 400 });
+      }
+      if (body.willBeLate && !isConfirmed) {
+        return NextResponse.json(
+          { error: "Only confirmed attendees can mark that they will be late" },
+          { status: 400 }
+        );
+      }
+      if (body.willBeLate) {
+        patch.willBeLate = true;
+      } else {
+        patch.willBeLate = FieldValue.delete();
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(body, "queuingForSpot")) {
+      if (typeof body.queuingForSpot !== "boolean") {
+        return NextResponse.json({ error: "queuingForSpot must be a boolean" }, { status: 400 });
+      }
+      if (body.queuingForSpot && isConfirmed) {
+        return NextResponse.json(
+          { error: "Waitlisted attendees only can mark that they will queue for a spot" },
+          { status: 400 }
+        );
+      }
+      if (body.queuingForSpot) {
+        patch.queuingForSpot = true;
+      } else {
+        patch.queuingForSpot = FieldValue.delete();
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return NextResponse.json({ error: "No valid fields to update" }, { status: 400 });
+    }
+
+    await ref.update(patch);
+
+    return NextResponse.json({ ok: true }, { status: 200 });
+  } catch (e) {
+    console.error("[hackathon event signup PATCH]", e);
+    return NextResponse.json({ error: "Failed to update RSVP" }, { status: 500 });
   }
 }
 

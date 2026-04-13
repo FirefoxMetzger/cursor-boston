@@ -8,6 +8,33 @@
  * Usage:
  *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run [--csv path/to/export.csv]
  *   npx tsx scripts/send-hack-a-sprint-emails.ts --send [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --send --announce-list [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --reminder [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --correction [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --dayof [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --waitlist-pr-deadline [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --confirmed-arrival-reminder [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --list-is-set [--csv path/to/export.csv]
+ *   npx tsx scripts/send-hack-a-sprint-emails.ts --dry-run --event-update [--csv path/to/export.csv]
+ *
+ * --announce-list: sends a simpler email linking to the participant list page
+ *   (accepted & waitlisted) instead of the full tier-specific emails.
+ *
+ * --reminder: day-before blast — confirmed vs waitlisted vs incomplete signup copy
+ *   (website registration, Luma “not going”, 4:00 PM arrival, late RSVP on site).
+ *
+ * --dayof: event-day blast — 4 PM / late message for confirmed; 10 AM PR merge cutoff
+ *   and open-PR queue guidance for waitlisted; shared community / governance copy for all.
+ *
+ * --waitlist-pr-deadline: **waitlisted recipients only** — short merge window, 4 PM arrival,
+ *   Discord for rank questions, and per-recipient open-PR + review status from GitHub (needs token).
+ *   Optional env: HACK_A_SPRINT_WAITLIST_PR_CUTOFF_LABEL, HACK_A_SPRINT_WAITLIST_PR_WINDOW_MINUTES.
+ *
+ * --confirmed-arrival-reminder: **confirmed recipients only** — be there by 4:00 PM ET (or say you’re late),
+ *   spot released if not checked in / no word by 4:30 PM ET; update Luma if not attending.
+ *
+ * --list-is-set: **all non-declined CSV registrants** — same copy for everyone; only the greeting name varies.
+ *   Final list + Luma + website registration + before 4 PM + community / maintainers “what’s next”.
  *
  * Requires: FIREBASE_SERVICE_ACCOUNT_JSON or GOOGLE_APPLICATION_CREDENTIALS;
  * Use the same **GITHUB_TOKEN** as production (e.g. from `.env.local`). PR counts use
@@ -23,7 +50,10 @@ loadEnvConfig(process.cwd());
 
 import type { DocumentData, Firestore } from "firebase-admin/firestore";
 import {
+  compareUnifiedHackathonRanking,
   CURSOR_CREDIT_TOP_N,
+  DECLINED_EMAILS,
+  JUDGE_EMAILS,
   getHackathonEventSignupBlockReason,
 } from "../lib/hackathon-event-signup";
 import { HACK_A_SPRINT_2026_EVENT_ID } from "../lib/hackathon-showcase";
@@ -31,6 +61,10 @@ import {
   fetchMergedPrCountByAuthorForRepo,
   fetchMergedPrCountsForLogins,
 } from "../lib/github-merged-pr-count";
+import {
+  fetchOpenPrsWithReviewStatusForAuthors,
+  type OpenPrWithReviewSummary,
+} from "../lib/github-open-pr-review-status";
 import { getGithubRepoPair, getGithubRepoWebBaseUrl } from "../lib/github-recent-merged-prs";
 import { getAdminAuth, getAdminDb } from "../lib/firebase-admin";
 import { sendEmail } from "../lib/mailgun";
@@ -38,12 +72,28 @@ import { sendEmail } from "../lib/mailgun";
 const SITE_ORIGIN = process.env.NEXT_PUBLIC_APP_URL || "https://cursorboston.com";
 const SIGNUP_PATH = "/hackathons/hack-a-sprint-2026/signup";
 const LUMA_URL = "https://luma.com/uixo8hl6";
+const DISCORD_INVITE_URL = "https://discord.gg/Wsncg8YYqc";
+
+/** Shown in --waitlist-pr-deadline copy (e.g. merge cutoff time). Override with env when sending. */
+const WAITLIST_PR_CUTOFF_LABEL =
+  process.env.HACK_A_SPRINT_WAITLIST_PR_CUTOFF_LABEL?.trim() || "3:20 PM ET";
+
+const WAITLIST_PR_WINDOW_MINUTES = (() => {
+  const n = Number.parseInt(
+    process.env.HACK_A_SPRINT_WAITLIST_PR_WINDOW_MINUTES ?? "40",
+    10
+  );
+  return Number.isFinite(n) && n > 0 ? n : 40;
+})();
 
 const GITHUB_COL_KEY = "What is your GitHub username?";
 const PR_COL_KEY =
   "Have you contributed to the repo?  If yes, last PR to https://github.com/rogerSuperBuilderAlpha/cursor-boston";
 
 const USER_ID_IN_CHUNK = 10;
+
+/** Update before send if the open PR queue size changed (see GitHub pulls tab). */
+const DAYOF_OPEN_PR_QUEUE_COUNT = 16;
 
 const INVALID_LOGIN_TOKENS = new Set([
   "",
@@ -320,6 +370,203 @@ async function buildLeaderboard(
   };
 }
 
+/** Same unified ordering as GET signup API (confirmed first, then PRs, …). */
+async function buildUnifiedDisplayRankMaps(
+  db: Firestore
+): Promise<{
+  rankByUserId: Map<string, number>;
+  rankByEmail: Map<string, number>;
+  /** Matches signup page `totalCount` (website + Luma-only, deduped). */
+  totalEntries: number;
+}> {
+  const eventId = HACK_A_SPRINT_2026_EVENT_ID;
+  const signupSnap = await db
+    .collection("hackathonEventSignups")
+    .where("eventId", "==", eventId)
+    .get();
+
+  const rows: {
+    userId: string;
+    email: string | null;
+    signedUpAtMs: number;
+    mergedPrCount: number;
+    confirmedAt: number | null;
+  }[] = [];
+
+  const userIds = signupSnap.docs.map((d) => d.data().userId as string).filter(Boolean);
+  const userMap = await fetchUserDataMap(db, userIds);
+  const firestoreMergedCounts = await countMergedCommunityPrsByUserIds(db, userIds);
+
+  const githubLogins: string[] = [];
+  for (const uid of userIds) {
+    const profile = userMap.get(uid);
+    const login =
+      profile?.github && typeof profile.github === "object"
+        ? (profile.github as { login?: string }).login
+        : undefined;
+    if (typeof login === "string" && login.trim()) githubLogins.push(login.trim());
+  }
+  const githubMergedByLogin = await fetchMergedPrCountsForLogins(githubLogins);
+
+  for (const doc of signupSnap.docs) {
+    const data = doc.data();
+    const userId = data.userId as string;
+    if (!userId) continue;
+    const profile = userMap.get(userId);
+    const gh =
+      profile?.github && typeof profile.github === "object"
+        ? (profile.github as { login?: string }).login
+        : undefined;
+    const githubLogin = typeof gh === "string" ? gh : null;
+    let pr = firestoreMergedCounts.get(userId) ?? 0;
+    if (githubLogin) {
+      const fromApi = githubMergedByLogin.get(githubLogin.toLowerCase());
+      if (fromApi !== undefined) pr = fromApi;
+    }
+    const emailRaw =
+      profile && typeof profile.email === "string" ? profile.email.toLowerCase() : null;
+    if (emailRaw && DECLINED_EMAILS.has(emailRaw)) continue;
+    rows.push({
+      userId,
+      email: emailRaw,
+      signedUpAtMs: signedUpAtToMs(data.signedUpAt),
+      mergedPrCount: pr,
+      confirmedAt: data.confirmedAt ? signedUpAtToMs(data.confirmedAt) : null,
+    });
+  }
+
+  const websiteEmails = new Set<string>();
+  const websiteGithubLogins = new Set<string>();
+  for (const uid of userIds) {
+    const profile = userMap.get(uid);
+    if (typeof profile?.email === "string") websiteEmails.add(profile.email.toLowerCase());
+    const g =
+      profile?.github && typeof profile.github === "object"
+        ? (profile.github as { login?: string }).login
+        : undefined;
+    if (typeof g === "string" && g.trim()) websiteGithubLogins.add(g.trim().toLowerCase());
+  }
+
+  const lumaSnap = await db
+    .collection("hackathonLumaRegistrants")
+    .where("eventId", "==", eventId)
+    .get();
+
+  const lumaGithubLogins: string[] = [];
+  type LumaRow = {
+    email: string;
+    name: string;
+    githubLogin: string | null;
+    lumaCreatedAt: string;
+    mergedPrCount: number;
+    confirmedAt: number | null;
+  };
+  const lumaRows: LumaRow[] = [];
+
+  for (const doc of lumaSnap.docs) {
+    const d = doc.data();
+    const email = (d.email as string || "").toLowerCase();
+    const ghLogin = typeof d.githubLogin === "string" ? d.githubLogin : null;
+    if (JUDGE_EMAILS.has(email) || DECLINED_EMAILS.has(email)) continue;
+    if (websiteEmails.has(email)) continue;
+    if (ghLogin && websiteGithubLogins.has(ghLogin.toLowerCase())) continue;
+    if (ghLogin) lumaGithubLogins.push(ghLogin);
+    lumaRows.push({
+      email,
+      name: typeof d.name === "string" ? d.name : "",
+      githubLogin: ghLogin,
+      lumaCreatedAt: typeof d.lumaCreatedAt === "string" ? d.lumaCreatedAt : "",
+      mergedPrCount: 0,
+      confirmedAt: d.confirmedAt ? signedUpAtToMs(d.confirmedAt) : null,
+    });
+  }
+
+  if (lumaGithubLogins.length > 0) {
+    const lumaPrCounts = await fetchMergedPrCountsForLogins(lumaGithubLogins);
+    for (const lr of lumaRows) {
+      if (lr.githubLogin) {
+        const count = lumaPrCounts.get(lr.githubLogin.toLowerCase());
+        if (count !== undefined) lr.mergedPrCount = count;
+      }
+    }
+  }
+
+  type EntrySource = "website" | "luma_only";
+  type UnifiedRow = {
+    userId: string | null;
+    email: string | null;
+    mergedPrCount: number;
+    signedUpAtMs: number;
+    source: EntrySource;
+    confirmedAt: number | null;
+  };
+
+  const unified: UnifiedRow[] = [];
+  for (const r of rows) {
+    unified.push({
+      userId: r.userId,
+      email: r.email,
+      mergedPrCount: r.mergedPrCount,
+      signedUpAtMs: r.signedUpAtMs,
+      source: "website",
+      confirmedAt: r.confirmedAt,
+    });
+  }
+  for (const lr of lumaRows) {
+    unified.push({
+      userId: null,
+      email: lr.email || null,
+      mergedPrCount: lr.mergedPrCount,
+      signedUpAtMs: lr.lumaCreatedAt ? new Date(lr.lumaCreatedAt).getTime() : 0,
+      source: "luma_only",
+      confirmedAt: lr.confirmedAt,
+    });
+  }
+
+  unified.sort(compareUnifiedHackathonRanking);
+
+  const rankByUserId = new Map<string, number>();
+  const rankByEmail = new Map<string, number>();
+  for (let i = 0; i < unified.length; i++) {
+    const u = unified[i]!;
+    const rank = i + 1;
+    if (u.userId) rankByUserId.set(u.userId, rank);
+    if (u.email) rankByEmail.set(u.email, rank);
+  }
+
+  return { rankByUserId, rankByEmail, totalEntries: unified.length };
+}
+
+async function buildSignupConfirmedByUserId(db: Firestore): Promise<Map<string, boolean>> {
+  const m = new Map<string, boolean>();
+  const snap = await db
+    .collection("hackathonEventSignups")
+    .where("eventId", "==", HACK_A_SPRINT_2026_EVENT_ID)
+    .get();
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const uid = d.userId as string;
+    if (!uid) continue;
+    m.set(uid, !!d.confirmedAt);
+  }
+  return m;
+}
+
+async function buildLumaConfirmedByEmail(db: Firestore): Promise<Map<string, boolean>> {
+  const m = new Map<string, boolean>();
+  const snap = await db
+    .collection("hackathonLumaRegistrants")
+    .where("eventId", "==", HACK_A_SPRINT_2026_EVENT_ID)
+    .get();
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    const email = String(d.email ?? "").toLowerCase();
+    if (!email) continue;
+    m.set(email, !!d.confirmedAt);
+  }
+  return m;
+}
+
 type MatchMethod = "auth" | "emailLookup" | "firestoreEmail" | "githubLogin" | null;
 
 async function resolveUserIdForEmail(
@@ -413,6 +660,30 @@ ${bodyHtml}
 </body></html>`;
 }
 
+function openIssuesHtml(): string {
+  const repoIssuesUrl = `${getGithubRepoWebBaseUrl()}/issues`;
+  return `<p><strong>Looking for something to work on?</strong> These open issues are great candidates for a quick PR:</p>
+<ul style="margin:8px 0;">
+<li><strong><a href="${escapeHtml(repoIssuesUrl)}/232">#232</a></strong> — Increase test coverage from 13.9% to 50%+ <em>(good first issue, testing)</em></li>
+<li><strong><a href="${escapeHtml(repoIssuesUrl)}/235">#235</a></strong> — Add JSDoc documentation to exported utility functions <em>(good first issue, docs)</em></li>
+<li><strong><a href="${escapeHtml(repoIssuesUrl)}/243">#243</a></strong> — Add bounds checking for Firestore query .docs[0] access <em>(bug fix)</em></li>
+<li><strong><a href="${escapeHtml(repoIssuesUrl)}/257">#257</a></strong> — Career Board for Cursor-Native Developers <em>(good first issue, feature)</em></li>
+<li><strong><a href="${escapeHtml(repoIssuesUrl)}/260">#260</a></strong> — AI Dev Terminology Glossary <em>(good first issue, feature)</em></li>
+</ul>
+<p style="font-size:13px;">See all open issues: <a href="${escapeHtml(repoIssuesUrl)}">${escapeHtml(repoIssuesUrl)}</a></p>`;
+}
+
+function openIssuesText(): string {
+  const repoIssuesUrl = `${getGithubRepoWebBaseUrl()}/issues`;
+  return `Looking for something to work on? Try these open issues:
+- #232 Increase test coverage (good first issue, testing)
+- #235 Add JSDoc documentation (good first issue, docs)
+- #243 Add bounds checking for Firestore .docs[0] (bug fix)
+- #257 Career Board for Cursor-Native Developers (good first issue)
+- #260 AI Dev Terminology Glossary (good first issue)
+All issues: ${repoIssuesUrl}`;
+}
+
 function commonEventBlockHtml(): string {
   const repoUrl = getGithubRepoWebBaseUrl();
   return `<p><strong>Cursor Boston Hack-a-Sprint</strong><br/>
@@ -469,6 +740,7 @@ function buildEmails(args: {
     lead = `<p>Hi ${first},</p>
 <p>The participant list is finalized. You’re <strong>#${rank}</strong> out of <strong>${totalOnLeaderboard}</strong> on the leaderboard with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}. We have <strong>${CURSOR_CREDIT_TOP_N}</strong> confirmed spots, so you’re currently on the <strong>waitlist</strong>.</p>
 <p><strong>You can still move up.</strong> Merged PRs are the #1 way to climb the leaderboard. Open a PR to <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> — documentation, bug fixes, and small features all count. As confirmed participants drop out or don’t show up, waitlisted builders move in <strong>by rank order</strong>.</p>
+${openIssuesHtml()}
 <p><strong>How day-of works:</strong> at 4:00 PM ET on April 13, unclaimed spots go to the waitlist in rank order. If you’d like a chance at a spot, be nearby and watch your email or Discord around 4:00 PM.</p>
 <p>If you know you won’t be coming, please remove yourself from <a href="${escapeHtml(LUMA_URL)}">Luma</a> so others can move up.</p>
 <p>Final leaderboard: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>`;
@@ -510,7 +782,7 @@ ${block}
     tier === "CONFIRMED" ?
       `You’re #${rank} — spot reserved for April 13. Confirm by submitting a PR to ${repoUrl} or replying to this email. Arrive by 4:00 PM ET. If you can’t come, remove yourself from Luma.`
     : tier === "WAITLISTED" ?
-      `You’re #${rank} on the waitlist. Merge PRs to ${repoUrl} to move up. At 4:00 PM ET on April 13, unclaimed spots go to waitlist in rank order. If not coming, remove yourself from Luma.`
+      `You’re #${rank} on the waitlist. Merge PRs to ${repoUrl} to move up. At 4:00 PM ET on April 13, unclaimed spots go to waitlist in rank order. If not coming, remove yourself from Luma.\n\n${openIssuesText()}`
     : tier === "SIGNED_UP_NO_SPOT" ?
       `Claim your leaderboard spot: ${signupUrl}` +
         (profileBlockReason ? ` First fix: ${profileBlockReason}` : "") +
@@ -524,9 +796,905 @@ ${block}
   return { subject, html, text: textParts.join("\n") };
 }
 
+function buildListAnnouncementEmail(args: {
+  tier: Exclude<RegistrantTier, "DECLINED">;
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+}): { subject: string; html: string; text: string } {
+  const { tier, name, rank, totalOnLeaderboard, mergedPrCount } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const repoUrl = getGithubRepoWebBaseUrl();
+
+  const subject = "Hack-a-Sprint: Accepted & waitlisted participants list is live";
+
+  let statusLine: string;
+  if (tier === "CONFIRMED" && rank !== null) {
+    statusLine = `You're <strong>#${rank}</strong> out of <strong>${totalOnLeaderboard}</strong> with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"} — <strong style="color:#059669;">confirmed</strong>.`;
+  } else if (tier === "WAITLISTED" && rank !== null) {
+    statusLine = `You're <strong>#${rank}</strong> out of <strong>${totalOnLeaderboard}</strong> with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"} — currently on the <strong style="color:#d97706;">waitlist</strong>. You can still move up by merging PRs to <a href="${escapeHtml(repoUrl)}">the community repo</a>.`;
+  } else if (tier === "SIGNED_UP_NO_SPOT") {
+    statusLine = `We found your cursorboston.com account but you haven't joined the signup list yet — go to the page below to claim your spot.`;
+  } else {
+    statusLine = `You registered on Luma but we don't see a matching cursorboston.com account yet — create one and claim your spot on the page below.`;
+  }
+
+  const html = emailShell(`<p>Hi ${first},</p>
+<p>The accepted and waitlisted participant list for <strong>Hack-a-Sprint</strong> is now live. You can see the full list, your ranking, and your status here:</p>
+<p style="margin:16px 0;"><a href="${escapeHtml(signupUrl)}" style="display:inline-block;background:#059669;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;">View participant list</a></p>
+<p>${statusLine}</p>
+${tier === "WAITLISTED" ? openIssuesHtml() : ""}
+<p>The top <strong>${CURSOR_CREDIT_TOP_N}</strong> are confirmed. Everyone else is on the waitlist. Rankings are based on merged PRs to the community repo, then by signup time.</p>
+${commonEventBlockHtml()}`);
+
+  const textStatusLine =
+    tier === "CONFIRMED" && rank !== null
+      ? `You're #${rank} of ${totalOnLeaderboard} (${mergedPrCount} merged PRs) — confirmed.`
+      : tier === "WAITLISTED" && rank !== null
+        ? `You're #${rank} of ${totalOnLeaderboard} (${mergedPrCount} merged PRs) — waitlisted. Merge PRs to move up.`
+        : tier === "SIGNED_UP_NO_SPOT"
+          ? `You have an account but haven't joined the signup list yet — claim your spot at the link below.`
+          : `Create a cursorboston.com account and claim your spot at the link below.`;
+
+  const text = [
+    `Hi ${name},`,
+    "",
+    "The accepted and waitlisted participant list for Hack-a-Sprint is now live.",
+    "",
+    `View the full list: ${signupUrl}`,
+    "",
+    textStatusLine,
+    "",
+    `Top ${CURSOR_CREDIT_TOP_N} are confirmed. Rankings = merged PRs to the community repo, then signup time.`,
+    "",
+    `Event: April 13, 2026 4–8 PM ET, Back Bay Boston. Luma: ${LUMA_URL}`,
+  ].join("\n");
+
+  return { subject, html, text };
+}
+
+function buildReminderEmail(args: {
+  tier: Exclude<RegistrantTier, "DECLINED">;
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+  profileBlockReason: string | null;
+  csvSelfReportedPr: string;
+}): { subject: string; html: string; text: string } {
+  const {
+    tier,
+    name,
+    rank,
+    totalOnLeaderboard,
+    mergedPrCount,
+    profileBlockReason,
+    csvSelfReportedPr,
+  } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const repoUrl = getGithubRepoWebBaseUrl();
+  const rankPhrase =
+    rank !== null ? `#${rank} of ${totalOnLeaderboard}` : "the list";
+
+  let subject: string;
+  let lead: string;
+
+  if (tier === "CONFIRMED") {
+    subject = "Hack-a-Sprint is Monday — your spot is confirmed";
+    lead = `<p>Hi ${first},</p>
+<p><strong>Monday, April 13</strong> is almost here. You have a <strong>confirmed spot</strong> on the website leaderboard (${rank !== null ? `rank <strong>#${rank}</strong> of <strong>${totalOnLeaderboard}</strong>` : "see the list"} · <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}).</p>
+<p><strong>Can’t make it?</strong> Please mark yourself as <strong>not going</strong> on Luma so we can offer your spot to the waitlist: <a href="${escapeHtml(LUMA_URL)}">${escapeHtml(LUMA_URL)}</a></p>
+<p><strong>Attending?</strong> You <strong>must register on the website</strong> to participate (leaderboard + day-of tools). Do it now — you can wait until you arrive, but it will be slow and annoying at the door: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+<p><strong>Arrive by 4:00 PM ET.</strong> If you are not checked in by 4:00 PM, your spot may be given to someone on the waitlist.</p>
+<p><strong>Running late but still coming?</strong> That’s OK — you <strong>must</strong> say so on the website (Day-of RSVP) or we may release your spot: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>`;
+  } else if (tier === "WAITLISTED") {
+    subject = "Hack-a-Sprint is Monday — waitlist update";
+    lead = `<p>Hi ${first},</p>
+<p>You are <strong>${rankPhrase}</strong> on the waitlist with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}. <strong>Admission is not guaranteed.</strong> There is <strong>no spectator room</strong> — only participants with a seat.</p>
+<p><strong>Want to try for an open spot?</strong> At <strong>4:00 PM ET</strong>, unclaimed confirmed spots go to waitlisters <strong>in rank order</strong>. On the website, you can indicate that you’ll be there to queue: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+<p><strong>Move up before Monday:</strong> Sign up on the website if you haven’t, and <strong>merge a PR</strong> to the community repo to climb the waitlist: <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a></p>
+${openIssuesHtml()}
+<p>If you’re not planning to queue, please remove yourself from <a href="${escapeHtml(LUMA_URL)}">Luma</a> so others can move up.</p>`;
+  } else if (tier === "SIGNED_UP_NO_SPOT") {
+    subject = "Hack-a-Sprint is Monday — finish website signup";
+    const block =
+      profileBlockReason ?
+        `<p><strong>Before you can claim your spot on the site:</strong> ${escapeHtml(profileBlockReason)}</p>`
+      : "";
+    lead = `<p>Hi ${first},</p>
+<p>We see your <strong>cursorboston.com</strong> account, but you’re <strong>not on the website signup list</strong> yet — so you’re not ranked for Monday.</p>
+${block}
+<p><strong>To get on the list:</strong> Complete your profile requirements and claim your spot: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+<p><strong>Waitlist / no guaranteed seat:</strong> Spots are limited and there is <strong>no spectator room</strong>. Merge PRs to <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> to improve your position.</p>
+<p><strong>Can’t attend?</strong> Mark not going on Luma: <a href="${escapeHtml(LUMA_URL)}">${escapeHtml(LUMA_URL)}</a></p>`;
+  } else {
+    subject = "Hack-a-Sprint is Monday — create your site account";
+    lead = `<p>Hi ${first},</p>
+<p>You’re approved on <strong>Luma</strong>, but we don’t see a matching <strong>cursorboston.com</strong> account — you’re <strong>not on the website leaderboard</strong> yet.</p>
+<p><strong>To compete or queue:</strong></p>
+<ol>
+<li>Create an account at <a href="${escapeHtml(SITE_ORIGIN)}">cursorboston.com</a> (this email if possible).</li>
+<li>Connect <strong>GitHub</strong> and <strong>Discord</strong>; public profile with Discord visible.</li>
+<li>Claim your spot: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></li>
+<li>Merge a PR to <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> to move up the waitlist.</li>
+</ol>
+<p><strong>Waitlist reality:</strong> Admission is <strong>not guaranteed</strong>. There is <strong>no spectator room</strong>. At 4:00 PM ET, open seats go to waitlisters in rank order — use the site to signal you’ll queue.</p>
+<p><strong>Can’t come?</strong> Mark not going on Luma: <a href="${escapeHtml(LUMA_URL)}">${escapeHtml(LUMA_URL)}</a></p>`;
+  }
+
+  const selfNote =
+    csvSelfReportedPr ?
+      `<p style="font-size:13px;color:#666;">(Your Luma free-text about contributions is not used for ranking; we use GitHub + our site.)</p>`
+    : "";
+
+  const html = emailShell(`${lead}${selfNote}${commonEventBlockHtml()}`);
+
+  const textParts = [
+    `Hi ${name},`,
+    "",
+    tier === "CONFIRMED" ?
+      `Confirmed spot (${rankPhrase}). Can't come? Mark not going on Luma: ${LUMA_URL}. Attending? Register on the site (required): ${signupUrl}. Arrive by 4:00 PM ET. Late? Indicate on site Day-of RSVP: ${signupUrl}`
+    : tier === "WAITLISTED" ?
+      `Waitlist ${rankPhrase}. Not guaranteed; no spectator room. Queue intent + signup: ${signupUrl}. Move up with PRs: ${repoUrl}\n\n${openIssuesText()}`
+    : tier === "SIGNED_UP_NO_SPOT" ?
+      `Finish website signup: ${signupUrl}` + (profileBlockReason ? ` (${profileBlockReason})` : "") + `. PRs: ${repoUrl}. Luma: ${LUMA_URL}`
+    : `Create account and claim spot: ${signupUrl}. Repo: ${repoUrl}. Luma: ${LUMA_URL}`,
+    "",
+    `Event: April 13, 2026 4–8 PM ET, Back Bay Boston.`,
+  ];
+
+  return { subject, html, text: textParts.join("\n") };
+}
+
+function dayOfCommunityBlockHtml(): string {
+  return `<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+<p><strong>Looking ahead: this is a community project.</strong></p>
+<p>There will be plenty of other Cursor Boston events — and you can help organize them. If you have a venue (or know someone who does), reach out to <a href="mailto:roger@cursorboston.com">roger@cursorboston.com</a> and we can put something together.</p>
+<p>I only have authority right now because I'm doing everything myself, but that's changing. I'll be sending out requests for repo maintainers soon, working with them to organize events, and doing my best to provide whatever support the community needs.</p>
+<p>I'm also going to stop making personal updates to the site from here on out (unless I have a cool idea). It's community-managed now. And soon I hope to move to a more communal backend as well. Lots of exciting stuff coming.</p>
+<p>Thank you sincerely for your contributions and participation. This community is already something special.</p>`;
+}
+
+function dayOfCommunityBlockText(): string {
+  return [
+    "",
+    "Looking ahead: this is a community project.",
+    "",
+    "There will be plenty of other Cursor Boston events — and you can help organize them. If you have a venue (or know someone who does), reach out to roger@cursorboston.com and we can put something together.",
+    "",
+    "I only have authority right now because I'm doing everything myself, but that's changing. I'll be sending out requests for repo maintainers soon, working with them to organize events, and doing my best to provide whatever support the community needs.",
+    "",
+    "I'm also going to stop making personal updates to the site from here on out (unless I have a cool idea). It's community-managed now. And soon I hope to move to a more communal backend as well. Lots of exciting stuff coming.",
+    "",
+    "Thank you sincerely for your contributions and participation. This community is already something special.",
+  ].join("\n");
+}
+
+function buildDayOfEmail(args: {
+  tier: Exclude<RegistrantTier, "DECLINED">;
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+  profileBlockReason: string | null;
+  csvSelfReportedPr: string;
+}): { subject: string; html: string; text: string } {
+  const {
+    tier,
+    name,
+    rank,
+    mergedPrCount,
+    profileBlockReason,
+    csvSelfReportedPr,
+  } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const repoUrl = getGithubRepoWebBaseUrl();
+  const pullsUrl = `${repoUrl.replace(/\/$/, "")}/pulls`;
+
+  const selfNote =
+    csvSelfReportedPr ?
+      `<p style="font-size:13px;color:#666;">(Your Luma free-text about contributions is not used for ranking; we use GitHub + our site.)</p>`
+    : "";
+
+  let subject: string;
+  let lead: string;
+  let textLead: string;
+
+  if (tier === "CONFIRMED") {
+    subject = "Hack-a-Sprint is TODAY — arrive by 4:00 PM or let us know";
+    lead = `<p>Hi ${first},</p>
+<p>You have a <strong>confirmed spot</strong>. <strong>Arrive by 4:00 PM ET</strong> or message <a href="mailto:roger@cursorboston.com">roger@cursorboston.com</a> that you will be late.</p>
+<p><strong>After 4:00 PM, unclaimed spots will be forfeited</strong> to waitlisted participants in rank order. We cannot guarantee access after that.</p>
+<p>We have a <strong>limited venue with fire code capacity</strong> — we must stay within the limit, no exceptions.</p>
+<p>Bring your laptop, charger, and something to build. The sprint starts <strong>4:30 PM ET</strong>.</p>`;
+    textLead = [
+      `Hi ${name},`,
+      "",
+      "You have a confirmed spot. Arrive by 4:00 PM ET or email roger@cursorboston.com if you will be late.",
+      "",
+      "After 4:00 PM, unclaimed spots are forfeited to the waitlist in rank order. We cannot guarantee access after that.",
+      "",
+      "Limited venue / fire code capacity — we must stay within the limit, no exceptions.",
+      "",
+      "Bring laptop, charger, something to build. Sprint starts 4:30 PM ET.",
+    ].join("\n");
+  } else if (tier === "WAITLISTED") {
+    subject = "Hack-a-Sprint is TODAY — PR deadline 10 AM, then waitlist at 4 PM";
+    const waitRankLead =
+      rank !== null ?
+        `You are <strong>#${rank}</strong> on the waitlist`
+      : `You are on the waitlist`;
+    lead = `<p>Hi ${first},</p>
+<p>${waitRankLead} with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}.</p>
+<p><strong>Get your PRs merged by 10:00 AM ET today.</strong> Nothing will be merged after that — merged PRs are the metric for waitlist ranking.</p>
+<p><strong>Before opening a new PR</strong>, check the <strong>${DAYOF_OPEN_PR_QUEUE_COUNT} open PRs</strong> already in queue so you don't duplicate work: <a href="${escapeHtml(pullsUrl)}">${escapeHtml(pullsUrl)}</a></p>
+<p>At <strong>4:00 PM ET</strong>, unclaimed confirmed spots go to the waitlist in rank order. Be nearby if you want a chance.</p>
+<p>We have a <strong>limited venue with fire code capacity</strong> — we sincerely apologize if we cannot accommodate everyone. There is <strong>no spectator room</strong>.</p>`;
+    textLead = [
+      `Hi ${name},`,
+      "",
+      `You are ${rank !== null ? `#${rank}` : "on"} the waitlist with ${mergedPrCount} merged PRs.`,
+      "",
+      "Get your PRs merged by 10:00 AM ET today. Nothing counts after that for waitlist ranking.",
+      "",
+      `Before opening a new PR, check the ${DAYOF_OPEN_PR_QUEUE_COUNT} open PRs in queue: ${pullsUrl}`,
+      "",
+      "At 4:00 PM ET, unclaimed confirmed spots go to the waitlist in rank order. Be nearby if you want a chance.",
+      "",
+      "Limited venue / fire code — we apologize if we cannot accommodate everyone. No spectator room.",
+    ].join("\n");
+  } else if (tier === "SIGNED_UP_NO_SPOT") {
+    subject = "Hack-a-Sprint is TODAY — complete website signup to queue";
+    const block =
+      profileBlockReason ?
+        `<p><strong>Before you can join the list:</strong> ${escapeHtml(profileBlockReason)}</p>`
+      : "";
+    lead = `<p>Hi ${first},</p>
+<p><strong>Complete your website registration</strong> if you want to queue for a waitlist spot today: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+${block}`;
+    textLead = [
+      `Hi ${name},`,
+      "",
+      `Complete your website registration if you want to queue for a waitlist spot today: ${signupUrl}`,
+      ...(profileBlockReason ? [`(${profileBlockReason})`] : []),
+    ].join("\n");
+  } else {
+    subject = "Hack-a-Sprint is TODAY — complete website signup to queue";
+    lead = `<p>Hi ${first},</p>
+<p><strong>Complete your website registration</strong> if you want to queue for a waitlist spot today: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+<p>Create an account at <a href="${escapeHtml(SITE_ORIGIN)}">cursorboston.com</a> (this email if possible), connect GitHub + Discord with a public profile, then claim your spot at the link above.</p>`;
+    textLead = [
+      `Hi ${name},`,
+      "",
+      `Complete your website registration if you want to queue for a waitlist spot today: ${signupUrl}`,
+      "",
+      `Create an account at ${SITE_ORIGIN}, connect GitHub + Discord, then claim your spot.`,
+    ].join("\n");
+  }
+
+  const html = emailShell(`${lead}${selfNote}${dayOfCommunityBlockHtml()}${commonEventBlockHtml()}`);
+  const text = [textLead, dayOfCommunityBlockText(), "", `Event: April 13, 2026 4–8 PM ET, Back Bay Boston. Luma: ${LUMA_URL}`].join("\n");
+
+  return { subject, html, text };
+}
+
+function buildConfirmedArrivalReminderEmail(args: {
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+}): { subject: string; html: string; text: string } {
+  const { name, rank, totalOnLeaderboard, mergedPrCount } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const subject = "Hack-a-Sprint TODAY — be here by 4:00 PM ET (or tell us you’re running late)";
+
+  const rankLine =
+    rank !== null ?
+      `You have a <strong>confirmed seat</strong> — you’re <strong>#${rank}</strong> on the public list (of <strong>${totalOnLeaderboard}</strong>) with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}.`
+    : `You have a <strong>confirmed seat</strong> on the Hack-a-Sprint list.`;
+
+  const lead = `<p>Hi ${first},</p>
+<p>${rankLine}</p>
+<p><strong>Please plan to arrive at or before 4:00 PM ET.</strong> If you’re running late but still coming, <strong>let us know before 4:00 PM ET</strong> so we can try to hold your spot — reply to this email, write <a href="mailto:roger@cursorboston.com">roger@cursorboston.com</a>, or use the day-of tools on the website: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></p>
+<p><strong>If you are not checked in and we have not heard from you by 4:30 PM ET, we will release your seat</strong> to the waitlist. Please don’t assume we’ll wait indefinitely.</p>
+<p><strong>Can’t attend?</strong> Update your status on <strong>Luma</strong> as soon as you know you’re not coming (<a href="${escapeHtml(LUMA_URL)}">${escapeHtml(LUMA_URL)}</a>) so people on the waitlist can plan. That helps everyone.</p>
+<p>Sprint kicks off at <strong>4:30 PM ET</strong>. Bring your laptop and charger.</p>`;
+
+  const text = [
+    `Hi ${name},`,
+    "",
+    rank !== null ?
+      `Confirmed seat — #${rank} of ${totalOnLeaderboard} on the list (${mergedPrCount} merged PRs).`
+    : "Confirmed seat for Hack-a-Sprint.",
+    "",
+    "Arrive at or before 4:00 PM ET. Running late but coming? Tell us before 4:00 PM ET: reply, roger@cursorboston.com, or day-of on the site:",
+    signupUrl,
+    "",
+    "If you're not checked in and we haven't heard from you by 4:30 PM ET, we release your seat to the waitlist.",
+    "",
+    "Can't make it? Update your status on Luma ASAP so waitlisted folks can plan:",
+    LUMA_URL,
+    "",
+    "Sprint starts 4:30 PM ET. Bring laptop + charger.",
+  ].join("\n");
+
+  const html = emailShell(`${lead}${commonEventBlockHtml()}`);
+  return { subject, html, text };
+}
+
+function listIsSetNextStepsHtml(): string {
+  const repoUrl = getGithubRepoWebBaseUrl();
+  return `<hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;" />
+<p><strong>After tonight — what’s next?</strong></p>
+<p>Cursor Boston is meant to grow beyond one-off events. If you want to <strong>help maintain</strong> the <a href="${escapeHtml(repoUrl)}">community repo</a>, <strong>co-organize a meetup or hack night</strong>, or bring <strong>a new idea</strong> for the site or the group, there will be room for you.</p>
+<p>We’ll be reaching out about <strong>repo maintainers</strong> and clearer paths to co-organize. If you have a venue, a theme, or time to help run things, email <a href="mailto:roger@cursorboston.com">roger@cursorboston.com</a> and we’ll connect you.</p>
+<p>The project is <strong>community-driven</strong> — the more people shaping it, the stronger it gets. Thank you for showing up and building with us.</p>`;
+}
+
+function listIsSetNextStepsText(): string {
+  const repoUrl = getGithubRepoWebBaseUrl();
+  return [
+    "",
+    "After tonight — what's next?",
+    "",
+    `Want to help maintain the community repo (${repoUrl}), co-organize events, or pitch ideas? We'll be inviting repo maintainers and making it easier to co-organize.`,
+    "",
+    "Venue, theme, or time to help? Email roger@cursorboston.com.",
+    "",
+    "Thank you for being part of Cursor Boston.",
+  ].join("\n");
+}
+
+/** Same body for every recipient; only `name` in the greeting is personalized. */
+function buildListIsSetEmail(name: string): { subject: string; html: string; text: string } {
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const subject = "Hack-a-Sprint: the participant list is set — check the website";
+
+  const lead = `<p>Hi ${first},</p>
+<p><strong>The participant list is set.</strong> Your status (confirmed or waitlisted) and position are on the website — that’s the source of truth:</p>
+<p style="margin:16px 0;"><a href="${escapeHtml(signupUrl)}" style="display:inline-block;background:#059669;color:#fff;padding:10px 20px;border-radius:8px;text-decoration:none;font-weight:600;">View the Hack-a-Sprint list</a></p>
+<p><strong>Plan to arrive before 4:00 PM ET</strong> if you want to hold your place in line for a seat. Late arrivals may miss out if we’ve already moved to the waitlist.</p>
+<p><strong>Please register on the website before you arrive</strong> (same link above) if you haven’t already — it makes check-in much faster at the door.</p>
+<p><strong>Can’t make it?</strong> Update your registration status on <strong>Luma</strong> as soon as you know, so waitlisted people can plan: <a href="${escapeHtml(LUMA_URL)}">${escapeHtml(LUMA_URL)}</a></p>
+${listIsSetNextStepsHtml()}`;
+
+  const text = [
+    `Hi ${name},`,
+    "",
+    "The participant list is set. See your status (confirmed or waitlisted) on the website:",
+    signupUrl,
+    "",
+    "Arrive before 4:00 PM ET to hold your spot in line for a seat.",
+    "",
+    "Register on the website before you arrive if you can — faster check-in:",
+    signupUrl,
+    "",
+    "Can't make it? Update your status on Luma:",
+    LUMA_URL,
+    listIsSetNextStepsText(),
+  ].join("\n");
+
+  const html = emailShell(`${lead}${commonEventBlockHtml()}`);
+  return { subject, html, text };
+}
+
+function buildEventUpdateEmail(name: string): { subject: string; html: string; text: string } {
+  const first = escapeHtml(name);
+  const subject = "CORRECTION: Hack-a-Sprint schedule tonight — please read";
+
+  const lead = `<p>Hi ${first},</p>
+<p><strong>Correction to our last email — the schedule below is the correct one. Please disregard the times in the previous message.</strong></p>
+
+<h3 style="margin-top:20px;margin-bottom:12px;">Tonight's Schedule</h3>
+<table style="border-collapse:collapse;width:100%;margin:12px 0;font-size:15px;">
+<tr><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">4:00 PM</td><td style="padding:6px 12px;"><strong>Check in.</strong> If you're going to be late, let us know and we'll hold your spot until 4:30 PM at the latest.</td></tr>
+<tr style="background:#f9fafb;"><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">5:00 PM</td><td style="padding:6px 12px;"><strong>Hackathon starts.</strong> Bring your laptop and charger.</td></tr>
+<tr><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">5:30 PM</td><td style="padding:6px 12px;"><strong>Pizza arrives</strong> — Dirty Water Dough Co.</td></tr>
+<tr style="background:#f9fafb;"><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">7:00 PM</td><td style="padding:6px 12px;"><strong>Projects due.</strong> Finish and submit before 7.</td></tr>
+<tr><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">7:00–8:00 PM</td><td style="padding:6px 12px;"><strong>Peer reviews and judging.</strong></td></tr>
+<tr style="background:#f9fafb;"><td style="padding:6px 12px;font-weight:bold;white-space:nowrap;vertical-align:top;">8:00 PM</td><td style="padding:6px 12px;"><strong>Winners announced.</strong> Then head home.</td></tr>
+</table>
+
+<p><strong>On the waitlist?</strong> There is plenty of space — check your spot on the website. We'll send updates during the event if anything changes.</p>
+
+<h3 style="margin-top:20px;margin-bottom:12px;">Pizza — Dirty Water Dough Co.</h3>
+<p>16 large pizzas + 6 large salads incoming at 5:30:</p>
+<p style="font-size:14px;">5x Cheese, 2x Pepperoni, 1x Chicken Alfredo, 1x BBQ Chix, 1x Mac Cheesy, 2x Mediterranean, 1x Veggie, 1x Fenway Frank, 1x Sausage, 1x Steak 'n Cola<br/>
+2x Caesar Salad, 2x Greek Salad, 2x Caprese Salad</p>
+
+<p>See you tonight!</p>
+<p>— Roger & Cursor Boston</p>`;
+
+  const text = [
+    `Hi ${name},`,
+    "",
+    "CORRECTION — please use this schedule, not the one from the previous email.",
+    "",
+    "TONIGHT'S SCHEDULE:",
+    "  4:00 PM — Check in. Late? Let us know, we'll hold your spot until 4:30 max.",
+    "  5:00 PM — Hackathon starts.",
+    "  5:30 PM — Pizza arrives (Dirty Water Dough Co.)",
+    "  7:00 PM — Projects due. Submit before 7.",
+    "  7:00-8:00 PM — Peer reviews and judging.",
+    "  8:00 PM — Winners announced. Head home.",
+    "",
+    "Waitlisted? Plenty of space — check your spot on the website.",
+    "",
+    "PIZZA (16 large + 6 salads):",
+    "  5x Cheese, 2x Pepperoni, 1x Chicken Alfredo, 1x BBQ Chix,",
+    "  1x Mac Cheesy, 2x Mediterranean, 1x Veggie, 1x Fenway Frank,",
+    "  1x Sausage, 1x Steak 'n Cola",
+    "  2x Caesar Salad, 2x Greek Salad, 2x Caprese Salad",
+    "",
+    "See you tonight!",
+    "— Roger & Cursor Boston",
+  ].join("\n");
+
+  const html = emailShell(`${lead}`);
+  return { subject, html, text };
+}
+
+function buildWaitlistPrDeadlineEmail(args: {
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+  githubLogin: string | null;
+  /** From GitHub API; empty array = no open PRs for this login in the repo. */
+  openPrs: OpenPrWithReviewSummary[] | undefined;
+  cutoffLabel: string;
+}): { subject: string; html: string; text: string } {
+  const {
+    name,
+    rank,
+    totalOnLeaderboard,
+    mergedPrCount,
+    githubLogin,
+    openPrs,
+    cutoffLabel,
+  } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const repoUrl = getGithubRepoWebBaseUrl();
+  const pullsUrl = `${repoUrl.replace(/\/$/, "")}/pulls`;
+  const subject = `Hack-a-Sprint waitlist — ~${WAITLIST_PR_WINDOW_MINUTES} min left for PRs to count (by ${cutoffLabel})`;
+
+  const rankLine =
+    rank !== null ?
+      `You’re <strong>#${rank}</strong> on the waitlist (of <strong>${totalOnLeaderboard}</strong> on the public list) with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}.`
+    : `You’re on the waitlist with <strong>${mergedPrCount}</strong> merged PR${mergedPrCount === 1 ? "" : "s"}.`;
+
+  let prSectionHtml: string;
+  let prSectionText: string;
+
+  if (!githubLogin?.trim()) {
+    prSectionHtml = `<p>We don’t have a GitHub username on file for you from this registration path — merged PRs in <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> are what move you up. If you’ve been contributing under another handle, message me on <a href="${escapeHtml(DISCORD_INVITE_URL)}">Discord</a> with your GitHub login so we can sanity-check.</p>`;
+    prSectionText = `We may not have your GitHub username on file — PRs in ${repoUrl} are what move you up. If you use another handle, message on Discord: ${DISCORD_INVITE_URL}`;
+  } else if (!openPrs || openPrs.length === 0) {
+    prSectionHtml = `<p>Right now we don’t see any <strong>open</strong> pull requests from <strong>${escapeHtml(githubLogin)}</strong> in the community repo. If you just opened one, refresh in a minute; if you use a different GitHub account, tell us on Discord. To get a merge in before the cutoff, pick something small from <a href="${escapeHtml(pullsUrl)}">open PRs</a> (avoid duplicating work already in flight) or an <a href="${escapeHtml(repoUrl)}/issues">open issue</a>.</p>`;
+    prSectionText = `No open PRs from @${githubLogin} in the repo right now. If you use another account, say so on Discord. Open PR queue: ${pullsUrl}`;
+  } else {
+    const items = openPrs
+      .map(
+        (pr) =>
+          `<li><strong><a href="${escapeHtml(pr.htmlUrl)}">#${pr.number}</a></strong> — ${escapeHtml(pr.title)}<br/><span style="color:#444;font-size:14px;">${escapeHtml(pr.reviewSummary)}</span></li>`
+      )
+      .join("");
+    prSectionHtml = `<p><strong>Your open PRs</strong> (check comments / CI so they can merge before <strong>${escapeHtml(cutoffLabel)}</strong>):</p><ul style="margin:8px 0;padding-left:20px;">${items}</ul>`;
+    prSectionText = [
+      "Your open PRs:",
+      ...openPrs.map(
+        (pr) =>
+          `- #${pr.number} ${pr.title} — ${pr.reviewSummary} (${pr.htmlUrl})`
+      ),
+    ].join("\n");
+  }
+
+  const lead = `<p>Hi ${first},</p>
+<p>${rankLine}</p>
+<p><strong>You have about ${WAITLIST_PR_WINDOW_MINUTES} minutes</strong> — anything merged by <strong>${escapeHtml(cutoffLabel)}</strong> can still improve your waitlist ranking. After that, we’re locking in order for day-of.</p>
+<p><strong>Day-of logistics:</strong></p>
+<ul>
+<li><strong>Arrive before 4:00 PM ET.</strong> Check in on the website to see your spot and status: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></li>
+<li><strong>Need your rank or a quick sanity-check?</strong> Message me on Discord: <a href="${escapeHtml(DISCORD_INVITE_URL)}">${escapeHtml(DISCORD_INVITE_URL)}</a> (include the email you used to register if it isn’t obvious).</li>
+</ul>
+${prSectionHtml}
+<p style="font-size:14px;color:#333;"><strong>If you have a PR open:</strong> read maintainer comments, fix CI failures, and resolve conversations so it’s merge-ready — don’t assume silence means it will land in time.</p>
+<p>At <strong>4:00 PM ET</strong>, empty confirmed seats go to the waitlist in rank order. Good luck — and thank you for building with us.</p>`;
+
+  const textRank =
+    rank !== null ?
+      `#${rank} on the waitlist (of ${totalOnLeaderboard}) with ${mergedPrCount} merged PRs`
+    : `on the waitlist with ${mergedPrCount} merged PRs`;
+
+  const text = [
+    `Hi ${name},`,
+    "",
+    textRank + ".",
+    "",
+    `About ${WAITLIST_PR_WINDOW_MINUTES} minutes left — merges by ${cutoffLabel} can still improve your ranking.`,
+    "",
+    `Arrive before 4:00 PM ET. Check in / your spot: ${signupUrl}`,
+    "",
+    `Questions about your spot or GitHub? Discord: ${DISCORD_INVITE_URL}`,
+    "",
+    prSectionText,
+    "",
+    "If you have a PR open: read comments, fix CI, resolve threads so it can merge.",
+    "",
+    "At 4:00 PM ET, open seats go to the waitlist in order.",
+    "",
+    `Repo: ${repoUrl}`,
+  ].join("\n");
+
+  const html = emailShell(`${lead}${commonEventBlockHtml()}`);
+  return { subject, html, text };
+}
+
+const RANKING_JSON_PATH = join(__dirname, "data/hack-a-sprint-2026-ranking.json");
+
+type CorrectionRow = {
+  email: string;
+  name: string;
+  githubLogin: string | null;
+  mergedPrCount: number;
+  rank: number;
+  tier: "CONFIRMED" | "WAITLISTED";
+};
+
+function loadCorrectionRanking(): CorrectionRow[] {
+  const data = JSON.parse(readFileSync(RANKING_JSON_PATH, "utf8")) as {
+    ranking: Array<{
+      rank: number;
+      status: "confirmed" | "waitlisted";
+      email: string;
+      name: string;
+      githubLogin: string | null;
+      prsThruApr9: number;
+      prsAllTime: number;
+    }>;
+    totalParticipants: number;
+  };
+
+  return data.ranking.map((r) => ({
+    email: r.email,
+    name: r.name,
+    githubLogin: r.githubLogin,
+    mergedPrCount: r.status === "confirmed" ? r.prsThruApr9 : r.prsAllTime,
+    rank: r.rank,
+    tier: r.status === "confirmed" ? "CONFIRMED" as const : "WAITLISTED" as const,
+  }));
+}
+
+function buildCorrectionEmail(args: {
+  tier: Exclude<RegistrantTier, "DECLINED">;
+  name: string;
+  rank: number | null;
+  totalOnLeaderboard: number;
+  mergedPrCount: number;
+}): { subject: string; html: string; text: string } {
+  const { tier, name, rank, totalOnLeaderboard, mergedPrCount } = args;
+  const first = escapeHtml(name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+  const repoUrl = getGithubRepoWebBaseUrl();
+
+  let subject: string;
+  let lead: string;
+
+  if (tier === "CONFIRMED") {
+    subject = "Hack-a-Sprint April 13 — your status is CONFIRMED (#" + rank + ")";
+    lead = `<p>Hi ${first},</p>
+<p>We apologize for the confusion caused by our previous emails — some contained incorrect status information. <strong>Please disregard those earlier messages.</strong> This email and the website are your source of truth going forward.</p>
+<p style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:12px 16px;"><strong>Your status: CONFIRMED — #${rank} of ${totalOnLeaderboard}</strong><br/>${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} · reserved seat · $50 Cursor credits at check-in</p>
+<p><strong>Check your live ranking anytime:</strong> <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a> — this is the <strong>source of truth</strong> for your status and position.</p>
+<p><strong>What you need to do:</strong></p>
+<ul>
+<li><strong>Arrive by 4:00 PM ET on April 13.</strong> Unclaimed spots at 4:00 PM go to the waitlist.</li>
+<li>Running late? Use the <strong>Day-of RSVP</strong> on the website or email roger@cursorboston.com so we hold your spot.</li>
+<li>Bring your laptop, charger, and something you want to build.</li>
+</ul>
+<p>Can't make it? You can <strong>give up your spot</strong> on the website so the next waitlisted person gets in. Or remove yourself from <a href="${escapeHtml(LUMA_URL)}">Luma</a>.</p>`;
+  } else if (tier === "WAITLISTED") {
+    subject = "Hack-a-Sprint April 13 — your status is WAITLISTED (#" + rank + ")";
+    lead = `<p>Hi ${first},</p>
+<p>We apologize for the confusion caused by our previous emails — some contained incorrect status information. <strong>Please disregard those earlier messages.</strong> This email and the website are your source of truth going forward.</p>
+<p style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;"><strong>Your status: WAITLISTED — #${rank} of ${totalOnLeaderboard}</strong><br/>${mergedPrCount} merged PR${mergedPrCount === 1 ? "" : "s"} · top ${CURSOR_CREDIT_TOP_N} are confirmed</p>
+<p><strong>Check your live ranking anytime:</strong> <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a> — this is the <strong>source of truth</strong> for your status and position. Rankings update in real time.</p>
+<p><strong>How to move up:</strong> Merge PRs to <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> — documentation, bug fixes, and features all count. As confirmed participants drop out or give up their spot, waitlisted builders move in by rank order.</p>
+${openIssuesHtml()}
+<p><strong>Day of (April 13):</strong> At 4:00 PM ET, unclaimed confirmed spots go to waitlisters in rank order. If you want a chance, be nearby and watch the website or your email around 4:00 PM.</p>
+<p>Not coming? Please remove yourself from <a href="${escapeHtml(LUMA_URL)}">Luma</a> so others can move up.</p>`;
+  } else {
+    subject = "Hack-a-Sprint April 13 — complete your registration";
+    lead = `<p>Hi ${first},</p>
+<p>We apologize for the confusion caused by our previous emails. <strong>Please disregard those earlier messages.</strong></p>
+<p>You're registered on Luma but not yet on the website leaderboard. To see your ranking and status, complete your registration:</p>
+<ol>
+<li>Create an account at <a href="${escapeHtml(SITE_ORIGIN)}">cursorboston.com</a> (use this same email if possible).</li>
+<li>Connect <strong>GitHub</strong> and <strong>Discord</strong> on your profile.</li>
+<li>Go to <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a> and <strong>claim your spot</strong>.</li>
+</ol>
+<p>The website is the <strong>source of truth</strong> for rankings. Top ${CURSOR_CREDIT_TOP_N} are confirmed; everyone else is waitlisted. Merge PRs to <a href="${escapeHtml(repoUrl)}">${escapeHtml(repoUrl)}</a> to move up.</p>`;
+  }
+
+  const html = emailShell(`${lead}${commonEventBlockHtml()}`);
+
+  const textParts = [
+    `Hi ${name},`,
+    "",
+    "We apologize for the confusion from our previous emails — some had incorrect status info. Please disregard those. This email and the website are your source of truth.",
+    "",
+    tier === "CONFIRMED" ?
+      `YOUR STATUS: CONFIRMED — #${rank} of ${totalOnLeaderboard}. Reserved seat, $50 Cursor credits at check-in. Arrive by 4:00 PM ET April 13. Can't make it? Give up your spot on the website.`
+    : tier === "WAITLISTED" ?
+      `YOUR STATUS: WAITLISTED — #${rank} of ${totalOnLeaderboard}. Top ${CURSOR_CREDIT_TOP_N} are confirmed. Merge PRs to ${repoUrl} to move up. Day-of: unclaimed spots go to waitlist at 4:00 PM ET.\n\n${openIssuesText()}`
+    : `Complete your registration at ${signupUrl} to see your ranking.`,
+    "",
+    `Live rankings (source of truth): ${signupUrl}`,
+    `Event: April 13, 2026 4–8 PM ET, Back Bay Boston. Luma: ${LUMA_URL}`,
+  ];
+
+  return { subject, html, text: textParts.join("\n") };
+}
+
+const TOP_50_GUARANTEED_TARGETS: Array<{
+  rank: number;
+  name: string;
+  githubLogin: string | null;
+  mergedPrCount: number;
+}> = [
+  { rank: 1, name: "Rishab Nandi", githubLogin: "RshieRish", mergedPrCount: 15 },
+  { rank: 2, name: "Shreyas Sonwane", githubLogin: "Shreyas0786", mergedPrCount: 8 },
+  { rank: 3, name: "Sikes Mcrae", githubLogin: "Sikes1112", mergedPrCount: 7 },
+  { rank: 4, name: "Neha Chaudhari", githubLogin: "nebullii", mergedPrCount: 7 },
+  { rank: 5, name: "Cloudpost", githubLogin: "cloud-post-code", mergedPrCount: 2 },
+  { rank: 6, name: "Ryuu Leonardo Sato", githubLogin: "rysat0", mergedPrCount: 2 },
+  { rank: 7, name: "Abishek Bangalore Muralikrishna", githubLogin: "Abi5678", mergedPrCount: 1 },
+  { rank: 8, name: "Payal Sanjay Nagaonkar", githubLogin: "Payal2000", mergedPrCount: 1 },
+  { rank: 9, name: "zhixin zhang", githubLogin: "chloezhangzzc", mergedPrCount: 1 },
+  { rank: 10, name: "Jaydip dungarani", githubLogin: "17-jd", mergedPrCount: 1 },
+  { rank: 11, name: "Sam Blouir", githubLogin: "samblouir", mergedPrCount: 1 },
+  { rank: 12, name: "Michael Schulte", githubLogin: null, mergedPrCount: 0 },
+  { rank: 13, name: "Aaron Grace", githubLogin: "AaronGrace978", mergedPrCount: 0 },
+  { rank: 14, name: "John O'Brien", githubLogin: "johnobrien", mergedPrCount: 0 },
+  { rank: 15, name: "Iain Cai", githubLogin: "open2claw", mergedPrCount: 0 },
+  { rank: 16, name: "Taral T", githubLogin: "tvtt2k", mergedPrCount: 0 },
+  { rank: 17, name: "Priyanka Bhutada", githubLogin: "priyanka-0207", mergedPrCount: 0 },
+  { rank: 18, name: "Malik Zeeshan", githubLogin: "MalikZeeshan1122", mergedPrCount: 0 },
+  { rank: 19, name: "Bharath Vishal", githubLogin: "bharath-knight", mergedPrCount: 0 },
+  { rank: 20, name: "Emily L", githubLogin: "littlepuppi", mergedPrCount: 0 },
+  { rank: 21, name: "Eugenio Zuccarelli", githubLogin: "jayzuccarelli", mergedPrCount: 0 },
+  { rank: 22, name: "jd", githubLogin: "jackfruitsandwich", mergedPrCount: 0 },
+  { rank: 23, name: "Nithin Yash Menezes", githubLogin: "Nithin123q", mergedPrCount: 0 },
+  { rank: 24, name: "Manisha Sahu", githubLogin: "manishasahu271", mergedPrCount: 0 },
+  { rank: 25, name: "Kumar Reddy P V Sai", githubLogin: "saikumar221", mergedPrCount: 0 },
+  { rank: 26, name: "Rizvi Syed Abdul Sami", githubLogin: "abdulsami123", mergedPrCount: 0 },
+  { rank: 27, name: "Nicholas Kozhemiakin", githubLogin: "nickkozh", mergedPrCount: 0 },
+  { rank: 28, name: "Argenis De La Rosa", githubLogin: "theonlyhennygod", mergedPrCount: 0 },
+  { rank: 29, name: "Alex Zuffoletti", githubLogin: "alexcbzuff", mergedPrCount: 0 },
+  { rank: 30, name: "Mekhal Raj", githubLogin: "mekhalraj", mergedPrCount: 0 },
+  { rank: 31, name: "Kris Mondlane", githubLogin: "pappacorleone", mergedPrCount: 0 },
+  { rank: 32, name: "Andrew Ceniccola", githubLogin: "aceniccola", mergedPrCount: 0 },
+  { rank: 33, name: "Samet T", githubLogin: "samettemurcin", mergedPrCount: 0 },
+  { rank: 34, name: "Nikolay Vyahhi", githubLogin: "vyahhi", mergedPrCount: 0 },
+  { rank: 35, name: "Matthew Birov", githubLogin: "matthewb100", mergedPrCount: 0 },
+  { rank: 36, name: "Prarthana Krishnamurthy", githubLogin: "pkrishna1801", mergedPrCount: 0 },
+  { rank: 37, name: "Sebastian Wallk\u00f6tter", githubLogin: "FirefoxMetzger", mergedPrCount: 1 },
+  { rank: 38, name: "Satish Mallikarjun Paraddi", githubLogin: "satishparaddi", mergedPrCount: 0 },
+  { rank: 39, name: "Adhithyan Aravind", githubLogin: "Adhithyan245", mergedPrCount: 0 },
+  { rank: 40, name: "Brad Egan", githubLogin: "bradAGI", mergedPrCount: 41 },
+  { rank: 41, name: "Paramjeet Singh", githubLogin: "Paramjeet-singh-neu", mergedPrCount: 5 },
+  { rank: 42, name: "Manthan Admane", githubLogin: "MisterAwesome23", mergedPrCount: 4 },
+  { rank: 43, name: "Pradyumna Nunna", githubLogin: "Pradyumna369", mergedPrCount: 3 },
+  { rank: 44, name: "Naga Pavithra Lagisetty", githubLogin: "pavithralagisetty", mergedPrCount: 1 },
+  { rank: 45, name: "Ankit Yadav", githubLogin: "ankittejyadav", mergedPrCount: 1 },
+  { rank: 46, name: "Aakash Mukherjee", githubLogin: "aakashm1712", mergedPrCount: 1 },
+  { rank: 47, name: "Kannan", githubLogin: "notkannan", mergedPrCount: 1 },
+  { rank: 48, name: "Simba", githubLogin: "0x0Simba", mergedPrCount: 0 },
+  { rank: 49, name: "Monica Phang", githubLogin: "NobyDa", mergedPrCount: 0 },
+  { rank: 50, name: "Ashutosh Iwale", githubLogin: "AshutoshRavindraIwale", mergedPrCount: 0 },
+];
+
+const WAITLIST_51_PLUS_TARGETS: Array<{
+  rank: number;
+  name: string;
+  githubLogin: string | null;
+  mergedPrCount: number;
+}> = [
+  { rank: 51, name: "Ashish Bhatia", githubLogin: "ashbhati", mergedPrCount: 0 },
+  { rank: 52, name: "Yuri Braga", githubLogin: "yuribraga26", mergedPrCount: 0 },
+  { rank: 53, name: "Sanath Naik", githubLogin: "sanath11598", mergedPrCount: 0 },
+  { rank: 54, name: "Naveen Murali", githubLogin: "Naveennnm13", mergedPrCount: 0 },
+  { rank: 55, name: "Mark Robinson", githubLogin: "wakrson", mergedPrCount: 0 },
+  { rank: 56, name: "Janna Hong", githubLogin: "jannareverie", mergedPrCount: 0 },
+  { rank: 57, name: "Monica P", githubLogin: "Zombiedays", mergedPrCount: 0 },
+  { rank: 58, name: "Reghunaath", githubLogin: "Reghunaath", mergedPrCount: 0 },
+  { rank: 59, name: "Himanshu Chouhan", githubLogin: "himanshuchouhan", mergedPrCount: 0 },
+  { rank: 60, name: "Buse Demir", githubLogin: "busedemir", mergedPrCount: 0 },
+  { rank: 61, name: "Karthik Barma", githubLogin: "thebarmaeffect", mergedPrCount: 0 },
+  { rank: 62, name: "Caleb Hung", githubLogin: "calebhung", mergedPrCount: 0 },
+  { rank: 63, name: "Joshua Elkington", githubLogin: "axialxyz", mergedPrCount: 0 },
+  { rank: 64, name: "aatu usa", githubLogin: "aatmaj28", mergedPrCount: 0 },
+  { rank: 65, name: "Jinal Thakker", githubLogin: "jinalthakkar7", mergedPrCount: 0 },
+  { rank: 66, name: "Morad Hossain", githubLogin: "MGR", mergedPrCount: 0 },
+  { rank: 67, name: "Raphael Orcino", githubLogin: "RaphaelOrcino", mergedPrCount: 0 },
+  { rank: 68, name: "HK", githubLogin: "hirvita-kabariya", mergedPrCount: 0 },
+  { rank: 69, name: "Sakshi Chavan", githubLogin: "Sakshi3027", mergedPrCount: 0 },
+  { rank: 70, name: "Sneha Sonkusare", githubLogin: "snehasonkusare-tech", mergedPrCount: 0 },
+  { rank: 71, name: "Clevelini Maris", githubLogin: "yogesh", mergedPrCount: 0 },
+  { rank: 72, name: "Ramshankar B", githubLogin: "Ramshankar07", mergedPrCount: 0 },
+  { rank: 73, name: "Sai Bolla", githubLogin: "saikrishnabolla", mergedPrCount: 0 },
+  { rank: 74, name: "Ivo Rosa Montenegro", githubLogin: "ivormontenegro", mergedPrCount: 0 },
+  { rank: 75, name: "Michael Zhang", githubLogin: "heronalps", mergedPrCount: 0 },
+  { rank: 76, name: "Nikky Lu", githubLogin: "nikkylu", mergedPrCount: 0 },
+  { rank: 77, name: "Ridham Bhagat", githubLogin: "RasenRhino", mergedPrCount: 0 },
+  { rank: 78, name: "Zhi Hao", githubLogin: "zzzh1hao01", mergedPrCount: 0 },
+  { rank: 79, name: "Lucas", githubLogin: "lucasking0109", mergedPrCount: 0 },
+  { rank: 80, name: "Heer", githubLogin: "patelheer2910", mergedPrCount: 0 },
+  { rank: 81, name: "Siddhanth Pai", githubLogin: "Siddhanth99-tech", mergedPrCount: 0 },
+  { rank: 82, name: "Shruthi", githubLogin: "Shruthik99", mergedPrCount: 0 },
+  { rank: 83, name: "Danny Garcia Cortes", githubLogin: "DannyGarciaDEV", mergedPrCount: 0 },
+  { rank: 84, name: "Omkar Sheth", githubLogin: "OmkarSheth8", mergedPrCount: 0 },
+  { rank: 85, name: "Sreekar Siddula", githubLogin: "sreekar-ss", mergedPrCount: 0 },
+  { rank: 86, name: "Zara aura", githubLogin: "fghgfdhg", mergedPrCount: 0 },
+  { rank: 87, name: "Amit Anveri", githubLogin: "AmitAnveri", mergedPrCount: 0 },
+  { rank: 88, name: "Vasilis Tsolis", githubLogin: "okc0mputex", mergedPrCount: 0 },
+  { rank: 89, name: "Dagmawi Milkias", githubLogin: "Dagi2004", mergedPrCount: 0 },
+  { rank: 90, name: "Icey Roongpiti", githubLogin: "iceystarla", mergedPrCount: 0 },
+  { rank: 91, name: "Anmol Jaising", githubLogin: "jaisinganmol", mergedPrCount: 0 },
+  { rank: 92, name: "Andre Kirby", githubLogin: "AndreFKirby", mergedPrCount: 0 },
+  { rank: 93, name: "Yinzheng Guan", githubLogin: "yguan001", mergedPrCount: 0 },
+  { rank: 94, name: "Milo Scharwarx", githubLogin: "milo", mergedPrCount: 0 },
+  { rank: 95, name: "AHMAD ALI", githubLogin: "getahunxoder", mergedPrCount: 0 },
+  { rank: 96, name: "Chuan Xu", githubLogin: "Ozzyxu", mergedPrCount: 0 },
+  { rank: 97, name: "King Hrdx", githubLogin: null, mergedPrCount: 0 },
+  { rank: 98, name: "Rahul Dubey", githubLogin: "rahulgrows", mergedPrCount: 0 },
+];
+
+function buildTop50GuaranteedEmail(args: {
+  name: string;
+  rank: number;
+  mergedPrCount: number;
+}): { subject: string; html: string; text: string } {
+  const { name, rank } = args;
+  const firstName = escapeHtml(name.split(/\s+/)[0] || name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+
+  const subject = `Hack-a-Sprint: You're #${rank} — your spot is locked`;
+
+  const html = emailShell(`<p>Hi ${firstName},</p>
+<p>First — apologies for the volume of emails today. We've been sorting out the final list and this is the last one that matters.</p>
+<p>You're <strong>#${rank}</strong> in the top 50 as shown on the website (<a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a>). <strong>Your spot is locked.</strong></p>
+
+<p><strong>Arrive by 4:00 PM ET</strong></p>
+<ul>
+<li>Check in at the door starting at <strong>4:00 PM</strong>.</li>
+<li><strong>Running late?</strong> Let us know before 4:00 PM — reply to this email or write <a href="mailto:roger@cursorboston.com">roger@cursorboston.com</a>. We will hold your spot as long as we've heard from you.</li>
+</ul>
+
+<p><strong>Register on the website</strong></p>
+<p>If you haven't already, please register on the website <strong>before you arrive</strong> — it makes check-in much faster:</p>
+<ol>
+<li>Go to <a href="${escapeHtml(SITE_ORIGIN)}">${escapeHtml(SITE_ORIGIN)}</a> and create an account (or log in).</li>
+<li>Connect <strong>GitHub</strong> and <strong>Discord</strong> on your profile.</li>
+<li>Set your profile to <strong>public</strong> with Discord visible.</li>
+<li>Go to <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a> and <strong>claim your spot</strong>.</li>
+</ol>
+
+<p><strong>Can't make it?</strong></p>
+<p>Please decline on <a href="${escapeHtml(LUMA_URL)}">Luma</a> or reply to this email so we can give your spot to someone on the waitlist.</p>
+
+<p style="margin-top:16px;font-size:14px;color:#555;">We have a hard venue capacity limit. The worst thing that can happen is someone shows up and can't get in because we're full — so if you know you're not coming, please let us know as soon as possible.</p>
+
+${commonEventBlockHtml()}`);
+
+  const text = [
+    `Hi ${name.split(/\s+/)[0] || name},`,
+    "",
+    "Apologies for the volume of emails today — this is the last one that matters.",
+    "",
+    `You're #${rank} in the top 50 as shown on the website. Your spot is locked.`,
+    signupUrl,
+    "",
+    "ARRIVE BY 4:00 PM ET:",
+    "- Check in at the door starting at 4:00 PM.",
+    "- Running late? Let us know before 4:00 PM: reply or email roger@cursorboston.com",
+    "",
+    "REGISTER ON THE WEBSITE:",
+    `1. Go to ${SITE_ORIGIN} and create an account (or log in).`,
+    "2. Connect GitHub and Discord on your profile.",
+    "3. Set profile to public with Discord visible.",
+    `4. Claim your spot: ${signupUrl}`,
+    "",
+    "CAN'T MAKE IT?",
+    `Decline on Luma (${LUMA_URL}) or reply to this email.`,
+    "",
+    "We have a hard venue capacity limit. If you know you're not coming, please let us know ASAP so someone on the waitlist can take your spot.",
+    "",
+    `Event: April 13, 2026 4-8 PM ET, Back Bay Boston. Luma: ${LUMA_URL}`,
+  ].join("\n");
+
+  return { subject, html, text };
+}
+
+function buildWaitlistBottomEmail(args: {
+  name: string;
+  rank: number;
+}): { subject: string; html: string; text: string } {
+  const { name, rank } = args;
+  const firstName = escapeHtml(name.split(/\s+/)[0] || name);
+  const signupUrl = `${SITE_ORIGIN.replace(/\/$/, "")}${SIGNUP_PATH}`;
+
+  const subject = `Hack-a-Sprint: You're #${rank} on the waitlist`;
+
+  const html = emailShell(`<p>Hi ${firstName},</p>
+<p>Apologies for the volume of emails today — this is the one that matters for you.</p>
+<p>You're <strong>#${rank}</strong> on the Hack-a-Sprint waitlist. The top 50 have locked spots. <strong>Admission is not guaranteed</strong> for waitlisted participants — it depends on how many confirmed people show up and venue capacity.</p>
+
+<p><strong>If you want to try for a spot</strong></p>
+<ul>
+<li>Show up at <strong>4:00 PM ET</strong>. As confirmed participants don't show, seats open up in waitlist order.</li>
+<li><strong>Join our Discord</strong> and let us know you're coming so we can coordinate: <a href="${escapeHtml(DISCORD_INVITE_URL)}">${escapeHtml(DISCORD_INVITE_URL)}</a></li>
+<li>Check your rank on the website: <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a></li>
+</ul>
+
+<p><strong>Register on the website</strong></p>
+<p>If you haven't already, register before you arrive:</p>
+<ol>
+<li>Go to <a href="${escapeHtml(SITE_ORIGIN)}">${escapeHtml(SITE_ORIGIN)}</a> and create an account (or log in).</li>
+<li>Connect <strong>GitHub</strong> and <strong>Discord</strong> on your profile.</li>
+<li>Set your profile to <strong>public</strong> with Discord visible.</li>
+<li>Go to <a href="${escapeHtml(signupUrl)}">${escapeHtml(signupUrl)}</a> and <strong>claim your spot</strong>.</li>
+</ol>
+
+<p><strong>Not coming?</strong></p>
+<p>Please decline on <a href="${escapeHtml(LUMA_URL)}">Luma</a> or reply to this email.</p>
+
+<p style="margin-top:16px;font-size:14px;color:#555;">We have a hard venue capacity limit. The worst thing that can happen is someone shows up and can't get in because we're full. We don't want that to happen to you — so please join Discord if you're planning to come so we can give you a realistic expectation.</p>
+
+${commonEventBlockHtml()}`);
+
+  const text = [
+    `Hi ${name.split(/\s+/)[0] || name},`,
+    "",
+    "Apologies for the volume of emails — this is the one that matters for you.",
+    "",
+    `You're #${rank} on the waitlist. Top 50 have locked spots. Admission is NOT guaranteed for waitlisted participants.`,
+    "",
+    "IF YOU WANT TO TRY FOR A SPOT:",
+    "- Show up at 4:00 PM ET. Seats open as confirmed people don't show.",
+    `- Join Discord and let us know you're coming: ${DISCORD_INVITE_URL}`,
+    `- Check your rank: ${signupUrl}`,
+    "",
+    "REGISTER ON THE WEBSITE:",
+    `1. Go to ${SITE_ORIGIN} and create an account (or log in).`,
+    "2. Connect GitHub and Discord on your profile.",
+    "3. Set profile to public with Discord visible.",
+    `4. Claim your spot: ${signupUrl}`,
+    "",
+    "NOT COMING?",
+    `Decline on Luma (${LUMA_URL}) or reply to this email.`,
+    "",
+    "We have a hard venue capacity limit. Join Discord if you're planning to come so we can give you a realistic expectation.",
+    "",
+    `Event: April 13, 2026 4-8 PM ET, Back Bay Boston. Luma: ${LUMA_URL}`,
+  ].join("\n");
+
+  return { subject, html, text };
+}
+
 function parseArgs(argv: string[]) {
   const dryRun = argv.includes("--dry-run");
   const send = argv.includes("--send");
+  const announceList = argv.includes("--announce-list");
+  const reminder = argv.includes("--reminder");
+  const correction = argv.includes("--correction");
   const csvIdx = argv.indexOf("--csv");
   const csvPath =
     csvIdx >= 0 && argv[csvIdx + 1] ?
@@ -534,14 +1702,54 @@ function parseArgs(argv: string[]) {
     : join(
         homedir(),
         "Downloads",
-        "Cursor Boston Hack-a-Sprint - Guests - 2026-04-10-13-18-35.csv"
+        "Cursor Boston Hack-a-Sprint - Guests - 2026-04-13-14-12-00.csv"
       );
 
   if ((dryRun && send) || (!dryRun && !send)) {
     console.error("Specify exactly one of: --dry-run | --send");
     process.exit(1);
   }
-  return { dryRun, send, csvPath };
+  const dayof = argv.includes("--dayof");
+  const waitlistPrDeadline = argv.includes("--waitlist-pr-deadline");
+  const confirmedArrivalReminder = argv.includes("--confirmed-arrival-reminder");
+  const listIsSet = argv.includes("--list-is-set");
+  const eventUpdate = argv.includes("--event-update");
+  const top50Guaranteed = argv.includes("--top50-guaranteed");
+  const waitlistBottom = argv.includes("--waitlist-bottom");
+  const modeCount =
+    [
+      announceList,
+      reminder,
+      correction,
+      dayof,
+      waitlistPrDeadline,
+      confirmedArrivalReminder,
+      listIsSet,
+      eventUpdate,
+      top50Guaranteed,
+      waitlistBottom,
+    ].filter(Boolean).length;
+  if (modeCount > 1) {
+    console.error(
+      "Use only one of: --announce-list | --reminder | --correction | --dayof | --waitlist-pr-deadline | --confirmed-arrival-reminder | --list-is-set | --event-update | --top50-guaranteed | --waitlist-bottom"
+    );
+    process.exit(1);
+  }
+  return {
+    dryRun,
+    send,
+    announceList,
+    reminder,
+    correction,
+    dayof,
+    waitlistPrDeadline,
+    confirmedArrivalReminder,
+    listIsSet,
+    eventUpdate,
+    top50Guaranteed,
+    waitlistBottom,
+    csvPath,
+  };
 }
 
 async function sleep(ms: number) {
@@ -549,7 +1757,21 @@ async function sleep(ms: number) {
 }
 
 async function main() {
-  const { dryRun, send, csvPath } = parseArgs(process.argv.slice(2));
+  const {
+    dryRun,
+    send,
+    announceList,
+    reminder,
+    correction,
+    dayof,
+    waitlistPrDeadline,
+    confirmedArrivalReminder,
+    listIsSet,
+    eventUpdate,
+    top50Guaranteed,
+    waitlistBottom,
+    csvPath,
+  } = parseArgs(process.argv.slice(2));
 
   let raw: string;
   try {
@@ -566,6 +1788,242 @@ async function main() {
     }
   }
 
+  const csvRows = parseCsv(raw);
+  if (csvRows.length === 0) {
+    console.error("No data rows in CSV.");
+    process.exit(1);
+  }
+
+  console.log(`Loaded ${csvRows.length} rows from ${csvPath}`);
+
+  if (correction) {
+    console.log(`Loading ranking from ${RANKING_JSON_PATH}…`);
+    const ranked = loadCorrectionRanking();
+    const confirmedCount = ranked.filter((r) => r.tier === "CONFIRMED").length;
+    const waitlistedCount = ranked.filter((r) => r.tier === "WAITLISTED").length;
+    console.log(`\nCorrection ranking: ${ranked.length} participants (${confirmedCount} confirmed, ${waitlistedCount} waitlisted)`);
+
+    const pad = (s: string, n: number) => s.slice(0, n).padEnd(n);
+    for (const r of ranked) {
+      console.log(
+        [
+          pad(`#${r.rank}`, 5),
+          pad(r.tier, 12),
+          pad(r.email, 42),
+          `pr=${r.mergedPrCount}`,
+          r.githubLogin ? `@${r.githubLogin}` : "—",
+        ].join("  ")
+      );
+    }
+
+    if (dryRun) {
+      console.log("\n--dry-run --correction: no emails sent. Preview:");
+      const sampleConfirmed = ranked.find((r) => r.tier === "CONFIRMED");
+      const sampleWaitlisted = ranked.find((r) => r.tier === "WAITLISTED");
+      for (const sample of [sampleConfirmed, sampleWaitlisted]) {
+        if (!sample) continue;
+        const { subject, html } = buildCorrectionEmail({
+          tier: sample.tier,
+          name: sample.name,
+          rank: sample.rank,
+          totalOnLeaderboard: ranked.length,
+          mergedPrCount: sample.mergedPrCount,
+        });
+        console.log(`\n[${sample.tier}] Subject: ${subject}`);
+        console.log("HTML preview:\n---\n" + html.slice(0, 700) + "…\n---");
+      }
+      return;
+    }
+
+    let sent = 0;
+    let failed = 0;
+    for (const r of ranked) {
+      const { subject, html, text } = buildCorrectionEmail({
+        tier: r.tier,
+        name: r.name,
+        rank: r.rank,
+        totalOnLeaderboard: ranked.length,
+        mergedPrCount: r.mergedPrCount,
+      });
+      try {
+        await sendEmail({ to: r.email, subject, html, text });
+        sent++;
+        console.log(`Sent: ${r.email} (${r.tier} #${r.rank})`);
+      } catch (e) {
+        failed++;
+        console.error(`Failed: ${r.email}`, e);
+      }
+      await sleep(450);
+    }
+    console.log(`\nDone. Sent ${sent}, failed ${failed}.`);
+    return;
+  }
+
+  if (top50Guaranteed) {
+    console.log(`Loading ranking data from ${RANKING_JSON_PATH}…`);
+    const ranked = loadCorrectionRanking();
+
+    const emailByGithub = new Map<string, string>();
+    const emailByName = new Map<string, string>();
+    const nameByGithub = new Map<string, string>();
+    for (const r of ranked) {
+      if (r.githubLogin) {
+        emailByGithub.set(r.githubLogin.toLowerCase(), r.email);
+        nameByGithub.set(r.githubLogin.toLowerCase(), r.name);
+      }
+      emailByName.set(r.name.toLowerCase(), r.email);
+    }
+
+    type ResolvedTarget = {
+      rank: number;
+      name: string;
+      email: string | null;
+      mergedPrCount: number;
+    };
+
+    const targets: ResolvedTarget[] = TOP_50_GUARANTEED_TARGETS.map((t) => {
+      let email: string | null = null;
+      let resolvedName = t.name;
+      if (t.githubLogin) {
+        const key = t.githubLogin.toLowerCase();
+        email = emailByGithub.get(key) ?? null;
+        if (!resolvedName || resolvedName === "\u2014") {
+          resolvedName = nameByGithub.get(key) ?? t.name;
+        }
+      }
+      if (!email && resolvedName && resolvedName !== "\u2014") {
+        email = emailByName.get(resolvedName.toLowerCase()) ?? null;
+      }
+      return { rank: t.rank, name: resolvedName, email, mergedPrCount: t.mergedPrCount };
+    });
+
+    const unmatched = targets.filter((t) => !t.email);
+    if (unmatched.length > 0) {
+      console.error(
+        `Could not find email for ${unmatched.length} target(s):`,
+        unmatched.map((t) => `#${t.rank} ${t.name}`).join(", ")
+      );
+    }
+    const matched = targets.filter((t) => t.email);
+    console.log(`\nTop-50 guaranteed: ${matched.length} matched, ${unmatched.length} unmatched`);
+
+    const pad2 = (s: string, n: number) => s.slice(0, n).padEnd(n);
+    for (const t of targets) {
+      console.log(
+        `  ${pad2(`#${t.rank}`, 5)}  ${pad2(t.name, 35)}  ${pad2(t.email ?? "(no email)", 42)}  pr=${t.mergedPrCount}`
+      );
+    }
+
+    if (dryRun) {
+      console.log("\n--dry-run --top50-guaranteed: no emails sent. Preview:");
+      const sample = matched[0];
+      if (sample) {
+        const { subject, html } = buildTop50GuaranteedEmail({
+          name: sample.name,
+          rank: sample.rank,
+          mergedPrCount: sample.mergedPrCount,
+        });
+        console.log(`\nSubject: ${subject}`);
+        console.log("HTML preview:\n---\n" + html.slice(0, 2000) + "\u2026\n---");
+      }
+      return;
+    }
+
+    let sentG = 0;
+    let failedG = 0;
+    for (const t of matched) {
+      const { subject, html, text } = buildTop50GuaranteedEmail({
+        name: t.name,
+        rank: t.rank,
+        mergedPrCount: t.mergedPrCount,
+      });
+      try {
+        await sendEmail({ to: t.email!, subject, html, text });
+        sentG++;
+        console.log(`Sent: ${t.email} (#${t.rank} ${t.name})`);
+      } catch (e) {
+        failedG++;
+        console.error(`Failed: ${t.email}`, e);
+      }
+      await sleep(450);
+    }
+    console.log(`\nDone. Sent ${sentG}, failed ${failedG}, unmatched ${unmatched.length}.`);
+    return;
+  }
+
+  if (waitlistBottom) {
+    console.log(`Loading ranking data from ${RANKING_JSON_PATH}\u2026`);
+    const ranked = loadCorrectionRanking();
+
+    const emailByGithubW = new Map<string, string>();
+    const emailByNameW = new Map<string, string>();
+    const nameByGithubW = new Map<string, string>();
+    for (const r of ranked) {
+      if (r.githubLogin) {
+        emailByGithubW.set(r.githubLogin.toLowerCase(), r.email);
+        nameByGithubW.set(r.githubLogin.toLowerCase(), r.name);
+      }
+      emailByNameW.set(r.name.toLowerCase(), r.email);
+    }
+
+    type ResolvedWaitlist = { rank: number; name: string; email: string | null };
+    const wTargets: ResolvedWaitlist[] = WAITLIST_51_PLUS_TARGETS.map((t) => {
+      let email: string | null = null;
+      let resolvedName = t.name;
+      if (t.githubLogin) {
+        const key = t.githubLogin.toLowerCase();
+        email = emailByGithubW.get(key) ?? null;
+        if (!resolvedName || resolvedName === "\u2014") {
+          resolvedName = nameByGithubW.get(key) ?? t.name;
+        }
+      }
+      if (!email && resolvedName && resolvedName !== "\u2014") {
+        email = emailByNameW.get(resolvedName.toLowerCase()) ?? null;
+      }
+      return { rank: t.rank, name: resolvedName, email };
+    });
+
+    const wUnmatched = wTargets.filter((t) => !t.email);
+    const wMatched = wTargets.filter((t) => t.email);
+    console.log(`\nWaitlist bottom: ${wMatched.length} matched, ${wUnmatched.length} unmatched`);
+    if (wUnmatched.length > 0) {
+      console.error("Unmatched:", wUnmatched.map((t) => `#${t.rank} ${t.name}`).join(", "));
+    }
+
+    const padW = (s: string, n: number) => s.slice(0, n).padEnd(n);
+    for (const t of wTargets) {
+      console.log(`  ${padW(`#${t.rank}`, 5)}  ${padW(t.name, 30)}  ${t.email ?? "(no email)"}`);
+    }
+
+    if (dryRun) {
+      console.log("\n--dry-run --waitlist-bottom: no emails sent. Preview:");
+      const sample = wMatched[0];
+      if (sample) {
+        const { subject, html } = buildWaitlistBottomEmail({ name: sample.name, rank: sample.rank });
+        console.log(`\nSubject: ${subject}`);
+        console.log("HTML preview:\n---\n" + html.slice(0, 2000) + "\u2026\n---");
+      }
+      return;
+    }
+
+    let sentW = 0;
+    let failedW = 0;
+    for (const t of wMatched) {
+      const { subject, html, text } = buildWaitlistBottomEmail({ name: t.name, rank: t.rank });
+      try {
+        await sendEmail({ to: t.email!, subject, html, text });
+        sentW++;
+        console.log(`Sent: ${t.email} (#${t.rank} ${t.name})`);
+      } catch (e) {
+        failedW++;
+        console.error(`Failed: ${t.email}`, e);
+      }
+      await sleep(450);
+    }
+    console.log(`\nDone. Sent ${sentW}, failed ${failedW}, unmatched ${wUnmatched.length}.`);
+    return;
+  }
+
   const db = getAdminDb();
   if (!db) {
     console.error("Firebase Admin not configured (FIREBASE_SERVICE_ACCOUNT_JSON / GOOGLE_APPLICATION_CREDENTIALS).");
@@ -574,17 +2032,10 @@ async function main() {
 
   if (!process.env.GITHUB_TOKEN?.trim()) {
     console.warn(
-      "[warn] GITHUB_TOKEN is not set — GitHub Search may return 403; merged PR counts use Firestore where possible. Copy the token from your production/host env into .env.local for parity with the website."
+      "[warn] GITHUB_TOKEN is not set — GitHub Search may return 403; merged PR counts use Firestore where possible."
     );
   }
 
-  const csvRows = parseCsv(raw);
-  if (csvRows.length === 0) {
-    console.error("No data rows in CSV.");
-    process.exit(1);
-  }
-
-  console.log(`Loaded ${csvRows.length} rows from ${csvPath}`);
   console.log("Fetching merged PR counts from GitHub (one bulk search)…");
   const githubBulk = await fetchMergedPrCountByAuthorForRepo();
   if (githubBulk) {
@@ -598,8 +2049,16 @@ async function main() {
   }
 
   console.log("Building leaderboard snapshot…");
-  const { rankByUserId, prByUserId, totalOnLeaderboard, entries } =
-    await buildLeaderboard(db, githubBulk);
+  const { prByUserId, entries } = await buildLeaderboard(db, githubBulk);
+
+  console.log("Building unified display ranks (matches signup page ordering)…");
+  const {
+    rankByUserId: displayRankByUserId,
+    rankByEmail: displayRankByEmail,
+    totalEntries: totalOnPublicList,
+  } = await buildUnifiedDisplayRankMaps(db);
+  const signupConfirmedByUserId = await buildSignupConfirmedByUserId(db);
+  const lumaConfirmedByEmail = await buildLumaConfirmedByEmail(db);
 
   type RowResult = {
     email: string;
@@ -611,6 +2070,8 @@ async function main() {
     profileBlock: string | null;
     name: string;
     csvSelfReportedPr: string;
+    /** Resolved GitHub login (CSV or profile); null if unknown. */
+    githubLogin: string | null;
   };
 
   const results: RowResult[] = [];
@@ -636,6 +2097,7 @@ async function main() {
         profileBlock: null,
         name: displayNameFromRow(row),
         csvSelfReportedPr: selfPrText,
+        githubLogin: null,
       });
       continue;
     }
@@ -646,31 +2108,46 @@ async function main() {
     let rank: number | null = null;
     let mergedPr = 0;
     let profileBlock: string | null = null;
+    let githubLoginForRow: string | null = csvGithub;
 
     if (!uid) {
-      tier = "NO_SITE_ACCOUNT";
+      const lumaRank = displayRankByEmail.get(normalizedEmail);
       mergedPr = mergedPrForLogin(csvGithub, githubBulk);
+      if (lumaRank === undefined) {
+        tier = "NO_SITE_ACCOUNT";
+      } else {
+        rank = lumaRank;
+        tier = lumaConfirmedByEmail.get(normalizedEmail) ? "CONFIRMED" : "WAITLISTED";
+      }
     } else {
-      const leaderboardRank = rankByUserId.get(uid);
-      mergedPr = prByUserId.get(uid) ?? 0;
+      const userSnap = await db.collection("users").doc(uid).get();
+      const p = userSnap.data();
+      const profLogin =
+        p?.github && typeof p.github === "object" ?
+          (p.github as { login?: string }).login
+        : undefined;
+      const resolvedGithub =
+        csvGithub ||
+        (typeof profLogin === "string" ? profLogin.trim() : null);
+      githubLoginForRow = resolvedGithub;
 
-      if (leaderboardRank !== undefined) {
-        rank = leaderboardRank;
-        tier =
-          leaderboardRank <= CURSOR_CREDIT_TOP_N ? "CONFIRMED" : "WAITLISTED";
+      mergedPr = prByUserId.get(uid) ?? 0;
+      const dispRank =
+        displayRankByUserId.get(uid) ?? displayRankByEmail.get(normalizedEmail);
+
+      if (dispRank !== undefined) {
+        rank = dispRank;
+        const confirmed =
+          !!signupConfirmedByUserId.get(uid) ||
+          !!lumaConfirmedByEmail.get(normalizedEmail);
+        tier = confirmed ? "CONFIRMED" : "WAITLISTED";
+        if (!prByUserId.has(uid)) {
+          mergedPr = mergedPrForLogin(resolvedGithub, githubBulk);
+        }
       } else {
         tier = "SIGNED_UP_NO_SPOT";
-        const userSnap = await db.collection("users").doc(uid).get();
-        profileBlock = getHackathonEventSignupBlockReason(userSnap.data());
-        const p = userSnap.data();
-        const profLogin =
-          p?.github && typeof p.github === "object" ?
-            (p.github as { login?: string }).login
-          : undefined;
-        const gh =
-          csvGithub ||
-          (typeof profLogin === "string" ? profLogin.trim() : null);
-        mergedPr = mergedPrForLogin(gh, githubBulk);
+        profileBlock = getHackathonEventSignupBlockReason(p);
+        mergedPr = mergedPrForLogin(resolvedGithub, githubBulk);
       }
     }
 
@@ -684,6 +2161,7 @@ async function main() {
       profileBlock,
       name: displayNameFromRow(row),
       csvSelfReportedPr: selfPrText,
+      githubLogin: githubLoginForRow,
     });
   }
 
@@ -692,7 +2170,9 @@ async function main() {
     counts[r.tier] = (counts[r.tier] ?? 0) + 1;
   }
   console.log("\nSummary by tier:", counts);
-  console.log(`Leaderboard size (website): ${entries.length}\n`);
+  console.log(
+    `Public list size (website + Luma, deduped): ${totalOnPublicList}; website signups only: ${entries.length}\n`
+  );
 
   const pad = (s: string, n: number) => s.slice(0, n).padEnd(n);
 
@@ -708,37 +2188,291 @@ async function main() {
     console.log(line);
   }
 
+  let openPrByAuthor: Map<string, OpenPrWithReviewSummary[]> | null = null;
+  if (waitlistPrDeadline) {
+    if (!process.env.GITHUB_TOKEN?.trim()) {
+      console.warn(
+        "[warn] GITHUB_TOKEN is not set — open PR / review lookup may fail or rate-limit; set it for reliable per-recipient status."
+      );
+    }
+    const loginSet = new Set<string>();
+    for (const r of results) {
+      if (r.tier !== "WAITLISTED") continue;
+      const lg = r.githubLogin?.trim();
+      if (lg) loginSet.add(lg.toLowerCase());
+    }
+    console.log(
+      `\n--waitlist-pr-deadline: fetching open PRs + review state for ${loginSet.size} GitHub logins…`
+    );
+    openPrByAuthor = await fetchOpenPrsWithReviewStatusForAuthors(loginSet);
+    const withOpen = [...openPrByAuthor.values()].filter((a) => a.length > 0).length;
+    console.log(
+      `Open PR lookup: ${withOpen} waitlist author(s) with at least one open PR in ${getGithubRepoWebBaseUrl()}.`
+    );
+    for (const r of results) {
+      if (r.tier !== "WAITLISTED") continue;
+      const lg = r.githubLogin?.trim().toLowerCase() ?? "";
+      const prs = lg ? (openPrByAuthor.get(lg) ?? []) : [];
+      console.log(
+        `  ${pad(r.email, 38)} @${pad(r.githubLogin ?? "—", 22)} openPRs=${prs.length}${prs.length ? ` (${prs.map((p) => "#" + p.number).join(", ")})` : ""}`
+      );
+    }
+  }
+
   if (dryRun) {
     console.log("\n--dry-run: no emails sent. Review the table above.");
+    if (announceList) console.log("(--announce-list mode: simplified participant-list email)");
+    if (reminder) console.log("(--reminder mode: day-before blast)");
+    if (correction) console.log("(--correction mode: status correction email)");
+    if (dayof) console.log("(--dayof mode: event-day blast)");
+    if (waitlistPrDeadline) console.log("(--waitlist-pr-deadline: waitlisted only)");
+    if (confirmedArrivalReminder) console.log("(--confirmed-arrival-reminder: confirmed only)");
+    if (listIsSet) console.log("(--list-is-set: all non-declined; body identical except name)");
+    const pickSample = (t: RegistrantTier) => results.find((x) => x.tier === t && x.tier !== "DECLINED");
+
+    if (eventUpdate) {
+      const sample = results.find((r) => r.tier !== "DECLINED");
+      if (sample) {
+        const { subject, html } = buildEventUpdateEmail(sample.name);
+        console.log(`\n[event-update sample: ${sample.email}] Subject: ${subject}`);
+        console.log("Sample HTML preview:\n---\n" + html.slice(0, 2000) + "…\n---");
+      } else {
+        console.log("\nNo non-declined rows to preview.");
+      }
+      return;
+    }
+
+    if (listIsSet) {
+      const sample = results.find((r) => r.tier !== "DECLINED");
+      if (sample) {
+        const { subject, html } = buildListIsSetEmail(sample.name);
+        console.log(`\n[list-is-set sample: ${sample.email}] Subject: ${subject}`);
+        console.log("Sample HTML preview:\n---\n" + html.slice(0, 1100) + "…\n---");
+      } else {
+        console.log("\nNo non-declined rows to preview.");
+      }
+      return;
+    }
+
+    if (confirmedArrivalReminder) {
+      const sample = results.find((r) => r.tier === "CONFIRMED");
+      if (sample) {
+        const { subject, html } = buildConfirmedArrivalReminderEmail({
+          name: sample.name,
+          rank: sample.rank,
+          totalOnLeaderboard: totalOnPublicList,
+          mergedPrCount: sample.mergedPrCount,
+        });
+        console.log(`\n[CONFIRMED sample: ${sample.email}] Subject: ${subject}`);
+        console.log("Sample HTML preview:\n---\n" + html.slice(0, 900) + "…\n---");
+      } else {
+        console.log("\nNo CONFIRMED rows to preview.");
+      }
+      return;
+    }
+
+    if (waitlistPrDeadline) {
+      const waiters = results.filter((r) => r.tier === "WAITLISTED");
+      const withPrs = waiters.filter(
+        (r) => (openPrByAuthor?.get(r.githubLogin?.trim().toLowerCase() ?? "") ?? []).length > 0
+      );
+      const withoutPrs = waiters.filter(
+        (r) => (openPrByAuthor?.get(r.githubLogin?.trim().toLowerCase() ?? "") ?? []).length === 0
+      );
+      const samples = [
+        withPrs[0],
+        withoutPrs.find((r) => r.githubLogin?.trim()),
+        withoutPrs.find((r) => !r.githubLogin?.trim()),
+      ].filter(Boolean) as RowResult[];
+      for (const sample of samples) {
+        if (!sample) continue;
+        const lg = sample.githubLogin?.trim().toLowerCase() ?? "";
+        const openPrs =
+          sample.githubLogin?.trim() ? (openPrByAuthor?.get(lg) ?? []) : undefined;
+        const { subject, html } = buildWaitlistPrDeadlineEmail({
+          name: sample.name,
+          rank: sample.rank,
+          totalOnLeaderboard: totalOnPublicList,
+          mergedPrCount: sample.mergedPrCount,
+          githubLogin: sample.githubLogin,
+          openPrs,
+          cutoffLabel: WAITLIST_PR_CUTOFF_LABEL,
+        });
+        console.log(`\n[WAITLISTED sample: ${sample.email}] Subject: ${subject}`);
+        console.log("Sample HTML preview:\n---\n" + html.slice(0, 900) + "…\n---");
+      }
+      return;
+    }
+
+    if (reminder || correction || dayof) {
+      const previewTiers: RegistrantTier[] = [
+        "CONFIRMED",
+        "WAITLISTED",
+        "SIGNED_UP_NO_SPOT",
+        "NO_SITE_ACCOUNT",
+      ];
+      for (const tier of previewTiers) {
+        const sample = pickSample(tier);
+        if (!sample) continue;
+        const t = sample.tier as Exclude<RegistrantTier, "DECLINED">;
+        const emailArgs = {
+          tier: t,
+          name: sample.name,
+          rank: sample.rank,
+          totalOnLeaderboard: totalOnPublicList,
+          mergedPrCount: sample.mergedPrCount,
+          profileBlockReason: sample.profileBlock,
+          csvSelfReportedPr: sample.csvSelfReportedPr,
+        };
+        const { subject, html } =
+          correction ? buildCorrectionEmail(emailArgs)
+          : dayof ? buildDayOfEmail(emailArgs)
+          : buildReminderEmail(emailArgs);
+        console.log(`\n[${tier}] Sample subject: ${subject}`);
+        console.log("Sample HTML preview:\n---\n" + html.slice(0, 700) + "…\n---");
+      }
+      return;
+    }
+
     const sample = results.find((x) => x.tier === "CONFIRMED") || results.find((x) => x.tier !== "DECLINED");
     if (sample && sample.tier !== "DECLINED") {
-      const { html } = buildEmails({
-        tier: sample.tier as Exclude<RegistrantTier, "DECLINED">,
-        name: sample.name,
-        rank: sample.rank,
-        totalOnLeaderboard,
-        mergedPrCount: sample.mergedPrCount,
-        profileBlockReason: sample.profileBlock,
-        csvSelfReportedPr: sample.csvSelfReportedPr,
-      });
-      console.log("\nSample HTML preview (first non-declined row):\n---\n" + html.slice(0, 500) + "…\n---");
+      const tier = sample.tier as Exclude<RegistrantTier, "DECLINED">;
+      const { subject, html } = announceList
+        ? buildListAnnouncementEmail({
+            tier,
+            name: sample.name,
+            rank: sample.rank,
+            totalOnLeaderboard: totalOnPublicList,
+            mergedPrCount: sample.mergedPrCount,
+          })
+        : buildEmails({
+            tier,
+            name: sample.name,
+            rank: sample.rank,
+            totalOnLeaderboard: totalOnPublicList,
+            mergedPrCount: sample.mergedPrCount,
+            profileBlockReason: sample.profileBlock,
+            csvSelfReportedPr: sample.csvSelfReportedPr,
+          });
+      console.log(`\nSample subject: ${subject}`);
+      console.log("\nSample HTML preview (first non-declined row):\n---\n" + html.slice(0, 800) + "…\n---");
     }
     return;
   }
 
   let sent = 0;
   let failed = 0;
+  let skippedNonWaitlist = 0;
+  let skippedNonConfirmed = 0;
   for (const r of results) {
+    if (eventUpdate) {
+      if (r.tier === "DECLINED") continue;
+      const { subject, html, text } = buildEventUpdateEmail(r.name);
+      try {
+        await sendEmail({ to: r.email, subject, html, text });
+        sent++;
+        console.log(`Sent: ${r.email} (event-update)`);
+      } catch (e) {
+        failed++;
+        console.error(`Failed: ${r.email}`, e);
+      }
+      await sleep(450);
+      continue;
+    }
+
+    if (listIsSet) {
+      if (r.tier === "DECLINED") continue;
+      const { subject, html, text } = buildListIsSetEmail(r.name);
+      try {
+        await sendEmail({ to: r.email, subject, html, text });
+        sent++;
+        console.log(`Sent: ${r.email} (list-is-set)`);
+      } catch (e) {
+        failed++;
+        console.error(`Failed: ${r.email}`, e);
+      }
+      await sleep(450);
+      continue;
+    }
+
+    if (confirmedArrivalReminder) {
+      if (r.tier !== "CONFIRMED") {
+        skippedNonConfirmed++;
+        continue;
+      }
+      const { subject, html, text } = buildConfirmedArrivalReminderEmail({
+        name: r.name,
+        rank: r.rank,
+        totalOnLeaderboard: totalOnPublicList,
+        mergedPrCount: r.mergedPrCount,
+      });
+      try {
+        await sendEmail({ to: r.email, subject, html, text });
+        sent++;
+        console.log(`Sent: ${r.email} (CONFIRMED)`);
+      } catch (e) {
+        failed++;
+        console.error(`Failed: ${r.email}`, e);
+      }
+      await sleep(450);
+      continue;
+    }
+
+    if (waitlistPrDeadline) {
+      if (r.tier !== "WAITLISTED") {
+        skippedNonWaitlist++;
+        continue;
+      }
+      const lg = r.githubLogin?.trim().toLowerCase() ?? "";
+      const openPrs =
+        r.githubLogin?.trim() ? (openPrByAuthor?.get(lg) ?? []) : undefined;
+      const { subject, html, text } = buildWaitlistPrDeadlineEmail({
+        name: r.name,
+        rank: r.rank,
+        totalOnLeaderboard: totalOnPublicList,
+        mergedPrCount: r.mergedPrCount,
+        githubLogin: r.githubLogin,
+        openPrs,
+        cutoffLabel: WAITLIST_PR_CUTOFF_LABEL,
+      });
+      try {
+        await sendEmail({ to: r.email, subject, html, text });
+        sent++;
+        console.log(`Sent: ${r.email} (WAITLISTED)`);
+      } catch (e) {
+        failed++;
+        console.error(`Failed: ${r.email}`, e);
+      }
+      await sleep(450);
+      continue;
+    }
+
     if (r.tier === "DECLINED") continue;
-    const { subject, html, text } = buildEmails({
-      tier: r.tier as Exclude<RegistrantTier, "DECLINED">,
+    const tier = r.tier as Exclude<RegistrantTier, "DECLINED">;
+    const emailArgs = {
+      tier,
       name: r.name,
       rank: r.rank,
-      totalOnLeaderboard,
+      totalOnLeaderboard: totalOnPublicList,
       mergedPrCount: r.mergedPrCount,
       profileBlockReason: r.profileBlock,
       csvSelfReportedPr: r.csvSelfReportedPr ?? "",
-    });
+    };
+    const { subject, html, text } = correction
+      ? buildCorrectionEmail(emailArgs)
+      : reminder
+        ? buildReminderEmail(emailArgs)
+        : dayof
+          ? buildDayOfEmail(emailArgs)
+          : announceList
+            ? buildListAnnouncementEmail({
+                tier,
+                name: r.name,
+                rank: r.rank,
+                totalOnLeaderboard: totalOnPublicList,
+                mergedPrCount: r.mergedPrCount,
+              })
+            : buildEmails(emailArgs);
     try {
       await sendEmail({ to: r.email, subject, html, text });
       sent++;
@@ -749,7 +2483,25 @@ async function main() {
     }
     await sleep(450);
   }
-  console.log(`\nDone. Sent ${sent}, failed ${failed}, skipped declined ${counts["DECLINED"] ?? 0}`);
+  if (eventUpdate) {
+    console.log(
+      `\nDone. Sent ${sent}, failed ${failed}, skipped declined ${counts["DECLINED"] ?? 0}.`
+    );
+  } else if (listIsSet) {
+    console.log(
+      `\nDone. Sent ${sent}, failed ${failed}, skipped declined ${counts["DECLINED"] ?? 0}.`
+    );
+  } else if (confirmedArrivalReminder) {
+    console.log(
+      `\nDone. Sent ${sent}, failed ${failed}, skipped non-confirmed ${skippedNonConfirmed} (waitlist / incomplete / no-account / declined).`
+    );
+  } else if (waitlistPrDeadline) {
+    console.log(
+      `\nDone. Sent ${sent}, failed ${failed}, skipped non-waitlist ${skippedNonWaitlist} (confirmed / incomplete / no-account / declined).`
+    );
+  } else {
+    console.log(`\nDone. Sent ${sent}, failed ${failed}, skipped declined ${counts["DECLINED"] ?? 0}`);
+  }
 }
 
 main().catch((e) => {
